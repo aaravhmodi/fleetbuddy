@@ -42,6 +42,10 @@ Evaluation uses the same chat path and creates ordinary traces. The scorer is in
 
 The frontend is a single static page served by FastAPI. It includes upload/profile, chat, a live trace list, selectable step waterfall, analytics cards, two canvas charts, and the evaluation runner. Traces are refreshed after each turn without a page reload.
 
+Each successful data-backed chat answer also includes an evidence disclosure in the UI. It shows the tools used, the effective timeframe, the filters passed to those tools, the number of tool-result rows, and whether a result was capped. The adjacent bar chart is generated from structured tool output, not from text invented by the model. The response exposes both `trace_id` and `X-Trace-ID` so a caller can correlate the answer with the full trace.
+
+The model is prompted to use one grouped aggregation for fleet-wide rankings and trends. This keeps latency and cost lower than making one query per robot while still allowing separate calls for explicitly named comparisons.
+
 ## API overview
 
 - `POST /datasets` — multipart CSV upload and profile.
@@ -50,6 +54,8 @@ The frontend is a single static page served by FastAPI. It includes upload/profi
 - `GET /analytics` — aggregate timing, token, cost, outcome, and tool metrics.
 - `GET /evals` — bundled `evals.json` cases.
 - `POST /datasets/{id}/evals` — evaluate a supplied list of cases.
+
+The custom tracing here is intentional. The assignment explicitly prohibits OpenTelemetry and third-party tracing frameworks, so this project records the trace lifecycle directly and keeps it in memory.
 
 ## Next steps
 
