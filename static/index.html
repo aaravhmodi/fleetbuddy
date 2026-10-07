@@ -41,7 +41,7 @@
     async function request(url, options={}) { const r = await fetch(url, options); const body = await r.json(); if (!r.ok) throw new Error(body.detail || 'Request failed'); return body; }
     function normalizeLatexBlocks(content) {
       let normalized = String(content ?? '');
-      normalized = normalized.replace(/(^|\n)\s*\[\s*\n([\s\S]*?)\n\s*\](?=\s*(?:\n|$))/g, (_match,prefix,expression)=>prefix+'\n$$\n'+expression.trim()+'\n$$');
+      normalized = normalized.replace(/(^|\n)\s*\[\s*([\s\S]*?)\s*\](?=\s*(?:\n|$))/g, (_match,prefix,expression)=>/\\[A-Za-z]+|[=^_{}]/.test(expression) ? prefix+'\n$$\n'+expression.trim()+'\n$$' : _match);
       normalized = normalized.replace(/(^|\n)\s*\[\s*([^\n\]]+?)\s*\](?=\s*(?:\n|$))/g, (_match,prefix,expression)=>prefix+'\n\\('+expression.trim()+'\\)');
       normalized = normalized.replace(/\(\s*((?:\\(?:frac|text|approx|sqrt|sum|int|mathrm|mathbf|cdot|times|div)\b[\s\S]*?))\s*\)/g, (_match,expression)=>'\\('+expression.trim()+'\\)');
       return normalized;
