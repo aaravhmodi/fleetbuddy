@@ -34,6 +34,8 @@ INPUT_PRICE_PER_TOKEN = 0.15 / 1_000_000
 OUTPUT_PRICE_PER_TOKEN = 0.60 / 1_000_000
 MAX_MODEL_CALLS = 8
 MAX_TOOL_ROWS = 50
+MAX_QUERY_WINDOW_DAYS = 90
+MAX_FILTER_STRING_LENGTH = 64
 
 
 class Message(BaseModel):
@@ -163,6 +165,12 @@ def parse_dataset(raw: bytes) -> tuple[pd.DataFrame, dict[str, Any]]:
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
     if frame["battery_pct"].dropna().lt(0).any() or frame["battery_pct"].dropna().gt(100).any():
         raise ValueError("battery_pct must be between 0 and 100.")
+    for column in ["nitrogen_applied_l", "distance_m"]:
+        values = frame[column].dropna()
+        if not values.map(math.isfinite).all():
+            raise ValueError(f"{column} must contain finite numeric values.")
+        if values.lt(0).any():
+            raise ValueError(f"{column} cannot contain negative values.")
     return frame, profile_frame(frame)
 
 
@@ -175,7 +183,29 @@ def parse_date(value: str | None) -> pd.Timestamp | None:
     return parsed
 
 
+def validate_tool_window(args: dict[str, Any]) -> None:
+    for key in ("robot_id", "field"):
+        value = args.get(key)
+        if value is not None and len(str(value)) > MAX_FILTER_STRING_LENGTH:
+            raise ValueError(f"{key} exceeds maximum length of {MAX_FILTER_STRING_LENGTH}.")
+    if args.get("date") and (args.get("start_date") or args.get("end_date")):
+        raise ValueError("Use date or start_date/end_date, not both.")
+    if args.get("date"):
+        parse_date(str(args["date"]))
+        return
+    start = parse_date(args.get("start_date"))
+    end = parse_date(args.get("end_date"))
+    if start is None or end is None:
+        return
+    effective_end = end + pd.Timedelta(days=1) if len(str(args["end_date"])) <= 10 else end
+    if effective_end <= start:
+        raise ValueError("end_date must be after start_date.")
+    if effective_end - start > pd.Timedelta(days=MAX_QUERY_WINDOW_DAYS):
+        raise ValueError(f"Time window cannot exceed {MAX_QUERY_WINDOW_DAYS} days.")
+
+
 def filtered_frame(dataset: Dataset, args: dict[str, Any]) -> pd.DataFrame:
+    validate_tool_window(args)
     frame = dataset.frame
     robot_id = args.get("robot_id")
     state = args.get("state")
@@ -242,6 +272,10 @@ def run_aggregate_runs(dataset: Dataset, args: dict[str, Any]) -> dict[str, Any]
     valid_groups = {"robot_id", "field", "state", "date"}
     if any(group not in valid_groups for group in group_by):
         raise ValueError("group_by values must be robot_id, field, state, or date.")
+    if len(group_by) != len(set(group_by)):
+        raise ValueError("group_by values must be unique.")
+    if len(group_by) > 2:
+        raise ValueError("group_by supports at most two dimensions at a time.")
     metrics = args.get("metrics", ["sum_nitrogen", "sum_distance"])
     allowed_metrics = {
         "sum_nitrogen": ("nitrogen_applied_l", "sum"),
@@ -250,9 +284,22 @@ def run_aggregate_runs(dataset: Dataset, args: dict[str, Any]) -> dict[str, Any]
         "max_battery": ("battery_pct", "max"),
         "min_battery": ("battery_pct", "min"),
         "row_count": ("ts", "count"),
+        "robot_count": ("robot_id", "nunique"),
+        "efficiency_l_per_km": None,
     }
     if not metrics or any(metric not in allowed_metrics for metric in metrics):
-        raise ValueError("metrics must use sum_nitrogen, sum_distance, avg_battery, max_battery, min_battery, or row_count.")
+        raise ValueError("metrics must use sum_nitrogen, sum_distance, efficiency_l_per_km, avg_battery, max_battery, min_battery, row_count, or robot_count.")
+    if len(metrics) != len(set(metrics)):
+        raise ValueError("metrics values must be unique.")
+
+    def calculate_metric(source: pd.DataFrame, metric: str) -> Any:
+        if metric == "efficiency_l_per_km":
+            nitrogen = source["nitrogen_applied_l"].sum(min_count=1)
+            distance = source["distance_m"].sum(min_count=1)
+            return nitrogen / distance * 1000 if pd.notna(distance) and distance > 0 else None
+        column, operation = allowed_metrics[metric]
+        return getattr(source[column], operation)()
+
     work = frame.copy()
     if "date" in group_by:
         work["date"] = work["ts"].dt.strftime("%Y-%m-%d")
@@ -264,17 +311,12 @@ def run_aggregate_runs(dataset: Dataset, args: dict[str, Any]) -> dict[str, Any]
                 keys = (keys,)
             row = {name: json_safe(value) for name, value in zip(group_by, keys)}
             for metric in metrics:
-                column, operation = allowed_metrics[metric]
-                row[metric] = json_safe(getattr(group[column], operation)())
+                row[metric] = json_safe(calculate_metric(group, metric))
             rows.append(row)
         result_frame = pd.DataFrame(rows)
     else:
         result_frame = pd.DataFrame(
-            [{
-                metric: json_safe(getattr(work[column], operation)())
-                for metric in metrics
-                for column, operation in [allowed_metrics[metric]]
-            }]
+            [{metric: json_safe(calculate_metric(work, metric)) for metric in metrics}]
         )
     result = format_rows(result_frame, MAX_TOOL_ROWS, frame)
     result["filters"] = {key: value for key, value in args.items() if key not in {"group_by", "metrics"} and value is not None}
@@ -305,7 +347,7 @@ TOOLS = [
     {
         "type": "function",
         "name": "aggregate_runs",
-        "description": "Aggregate robot-run metrics for comparisons, totals, rates, and counts. For fleet-wide rankings or trends, omit robot_id and use group_by to get all robots or dates in one call; do not call once per robot unless the user names specific robots. Each source row is a five-minute interval, so row_count for charging can be converted to minutes by multiplying by 5.",
+        "description": "Aggregate robot-run metrics for comparisons, totals, rates, and counts. efficiency_l_per_km is calculated server-side as sum nitrogen_applied_l / sum distance_m * 1000 and is null when distance is missing or zero. robot_count is the distinct robots observed in each group, not a simultaneous headcount. For fleet-wide rankings or trends, omit robot_id and use group_by to get all robots or dates in one call; do not call once per robot unless the user names specific robots. Each source row is a five-minute interval, so row_count for charging can be converted to minutes by multiplying by 5.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -316,7 +358,7 @@ TOOLS = [
                 "state": {"type": "string", "enum": sorted(VALID_STATES)},
                 "field": {"type": "string", "description": "Farm field/location, such as North 40, Creekside, or Home Quarter. This is not a metric or CSV column name."},
                 "group_by": {"type": "array", "items": {"type": "string", "enum": ["robot_id", "field", "state", "date"]}},
-                "metrics": {"type": "array", "items": {"type": "string", "enum": ["sum_nitrogen", "sum_distance", "avg_battery", "max_battery", "min_battery", "row_count"]}},
+                "metrics": {"type": "array", "items": {"type": "string", "enum": ["sum_nitrogen", "sum_distance", "efficiency_l_per_km", "avg_battery", "max_battery", "min_battery", "row_count", "robot_count"]}},
             },
             "additionalProperties": False,
         },
@@ -327,7 +369,7 @@ TOOLS = [
 SYSTEM_PROMPT_TEMPLATE = """You are Fleet Buddy, an accurate analyst for a robot-run CSV.
 Answer only from tool results. The dataset profile below describes available columns and scope; it deliberately contains no rows.
 If the question asks for information outside the profile/data (for example weather), say clearly that the dataset cannot answer it. Do not invent facts.
-Use aggregate_runs for totals, comparisons, rates, and counts; use query_runs for exact events and timestamps. When calculating litres per kilometre, sum litres divided by sum metres times 1000. State assumptions and units, and round sensibly.
+Use aggregate_runs for totals, comparisons, rates, and counts; use query_runs for exact events and timestamps. For litres per kilometre, request the server-side efficiency_l_per_km metric and include sum_nitrogen and sum_distance when the numerator and denominator help explain the result. Never divide by zero or treat a null denominator as zero. `row_count` means five-minute source intervals, not distinct robots or events; use `robot_count` for distinct robots observed in a group and do not present it as simultaneous headcount. State assumptions and units, and round sensibly.
 The CSV column named field means farm field/location. Never put a metric name such as nitrogen_applied_l in field; metric names belong only in metrics.
 Format answers with Markdown: use **bold** for key results, headings with `##`, and bullet lists when useful. For equations, use `\\( ... \\)` for inline math and `$$ ... $$` for display math. For example, write `MR-01: \\(\\frac{{173.05}}{{16901}} \\approx 0.01024\\) L/m`, never `( \\frac{{...}} )` without delimiters. Never use bare `[` and `]` lines to delimit an equation. Do not wrap ordinary text in math delimiters.
 Always state the effective timeframe for time-based answers. If the user did not provide a date or date range, explicitly say "across the full dataset" and include the profile's start and end dates. Never call it a "selected timeframe" unless the user actually selected or supplied one.
@@ -376,10 +418,12 @@ def metric_label(metric: str) -> str:
     return {
         "sum_nitrogen": "Nitrogen applied (L)",
         "sum_distance": "Distance driven (m)",
+        "efficiency_l_per_km": "Efficiency (L/km)",
         "avg_battery": "Average battery (%)",
         "max_battery": "Maximum battery (%)",
         "min_battery": "Minimum battery (%)",
         "row_count": "Intervals / rows",
+        "robot_count": "Distinct robots observed",
     }.get(metric, metric.replace("_", " ").title())
 
 
@@ -469,6 +513,23 @@ def build_evidence(trace: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def normalize_latex_response(content: str) -> str:
+    """Normalize common model pseudo-LaTeX before returning the API reply."""
+    block_pattern = re.compile(r"(^|\n)\s*\[\s*([\s\S]*?)\s*\](?=\s*(?:\n|$))")
+
+    def replace_block(match: re.Match[str]) -> str:
+        expression = match.group(2).strip()
+        if not re.search(r"\\[A-Za-z]+|[=^_{}]", expression):
+            return match.group(0)
+        return f"{match.group(1)}\n$$\n{expression}\n$$"
+
+    normalized = block_pattern.sub(replace_block, str(content))
+    inline_pattern = re.compile(
+        r"\(\s*((?:\\(?:frac|text|approx|sqrt|sum|int|mathrm|mathbf|cdot|times|div)\b[\s\S]*?))\s*\)"
+    )
+    return inline_pattern.sub(lambda match: f"\\({match.group(1).strip()}\\)", normalized)
+
+
 def run_chat(dataset: Dataset, messages: list[Message]) -> dict[str, Any]:
     trace = {
         "id": f"tr_{uuid.uuid4().hex[:12]}",
@@ -518,7 +579,7 @@ def run_chat(dataset: Dataset, messages: list[Message]) -> dict[str, Any]:
             }
             trace["steps"].append(model_step)
             if not calls:
-                reply = text_output.strip()
+                reply = normalize_latex_response(text_output.strip())
                 break
             if call_number >= MAX_MODEL_CALLS:
                 trace["outcome"] = "stopped_at_cap"

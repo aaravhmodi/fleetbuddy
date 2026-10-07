@@ -5,7 +5,7 @@ import pandas as pd
 import pytest
 
 import main
-from main import Dataset, analytics, build_evidence, build_visualization, parse_dataset, run_aggregate_runs, run_chat, run_query_runs, score_reply
+from main import Dataset, analytics, build_evidence, build_visualization, normalize_latex_response, parse_dataset, run_aggregate_runs, run_chat, run_query_runs, score_reply
 
 
 CSV = Path(__file__).parents[1] / "robot_runs.csv"
@@ -34,6 +34,53 @@ def test_aggregate_totals_and_filter(dataset: Dataset) -> None:
     by_robot = {row["robot_id"]: row["sum_nitrogen"] for row in result["rows"]}
     assert by_robot["MR-04"] == pytest.approx(210.49)
     assert len(result["rows"]) == 6
+
+
+def test_server_calculates_efficiency_from_sums(dataset: Dataset) -> None:
+    result = run_aggregate_runs(dataset, {
+        "robot_id": "MR-04",
+        "date": "2026-06-14",
+        "state": "applying",
+        "metrics": ["efficiency_l_per_km", "sum_nitrogen", "sum_distance"],
+    })
+    row = result["rows"][0]
+    assert row["efficiency_l_per_km"] == pytest.approx(192.79 / 14941 * 1000)
+    assert row["sum_nitrogen"] == pytest.approx(192.79)
+    assert row["sum_distance"] == pytest.approx(14941)
+
+
+def test_robot_count_is_distinct_within_each_group(dataset: Dataset) -> None:
+    result = run_aggregate_runs(dataset, {"group_by": ["state"], "metrics": ["robot_count"]})
+    assert {row["state"]: row["robot_count"] for row in result["rows"]} == {
+        "applying": 6,
+        "charging": 6,
+        "driving": 6,
+        "fault": 2,
+        "idle": 6,
+    }
+
+
+def test_tool_rejects_invalid_or_oversized_time_windows(dataset: Dataset) -> None:
+    with pytest.raises(ValueError, match="after"):
+        run_query_runs(dataset, {"start_date": "2026-06-16", "end_date": "2026-06-15"})
+    with pytest.raises(ValueError, match="90 days"):
+        run_query_runs(dataset, {"start_date": "2026-01-01", "end_date": "2026-04-02"})
+
+
+def test_parse_rejects_negative_measurements() -> None:
+    raw = b"ts,robot_id,field,state,battery_pct,nitrogen_applied_l,distance_m\n2026-01-01T00:00:00Z,MR-01,F,driving,50,-1,2\n"
+    with pytest.raises(ValueError, match="nitrogen_applied_l cannot contain negative"):
+        parse_dataset(raw)
+
+
+def test_server_normalizes_model_latex_delimiters() -> None:
+    reply = normalize_latex_response(r"""[
+\text{Efficiency} = \frac{\text{Total Nitrogen Applied (L)}}{\text{Total Distance Traveled (m)}}
+]
+MR-01: ( \frac{173.05}{16901} \approx 0.01024 ) L/m""")
+    assert "$$" in reply
+    assert r"\(" in reply and r"\)" in reply
+    assert "\n[" not in reply and "\n]" not in reply
 
 
 def test_all_is_a_no_filter_value(dataset: Dataset) -> None:

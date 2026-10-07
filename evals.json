@@ -54,5 +54,29 @@
       {"role": "user", "content": "How much did that same robot apply on June 14?"}
     ],
     "expected": "MR-04, 192.79 L on June 14"
+  },
+  {
+    "messages": [{"role": "user", "content": "Break down the full dataset by robot-run state and convert the five-minute interval counts into hours and minutes."}],
+    "expected": "applying 3214 intervals, 267 hours 50 minutes; charging 839 intervals, 69 hours 55 minutes; driving 522 intervals, 43 hours 30 minutes; idle 599 intervals, 49 hours 55 minutes; fault 10 intervals, 50 minutes"
+  },
+  {
+    "messages": [{"role": "user", "content": "Which field had the greatest driving distance on June 15?"}],
+    "expected": "Creekside, 11036 m"
+  },
+  {
+    "messages": [{"role": "user", "content": "Which date had the lowest fleet efficiency in litres per kilometre, using total nitrogen divided by total distance and converting metres to kilometres?"}],
+    "expected": "June 16, approximately 7.85 L/km"
+  },
+  {
+    "messages": [{"role": "user", "content": "For fault intervals across the full dataset, which robots were affected and what was each robot's average battery?"}],
+    "expected": "MR-03 had 7 faults with approximately 45.27% average battery; MR-05 had 3 faults with approximately 64.47% average battery"
+  },
+  {
+    "messages": [{"role": "user", "content": "Which robot had the most applying distance, and which had the most driving distance, across the full dataset?"}],
+    "expected": "MR-02 had the most applying distance at 49007 m; MR-01 had the most driving distance at 16482 m"
+  },
+  {
+    "messages": [{"role": "user", "content": "How many distinct robots were observed in each state across the full dataset?"}],
+    "expected": "6 distinct robots were observed in applying, charging, driving, idle, and fault states"
   }
 ]
