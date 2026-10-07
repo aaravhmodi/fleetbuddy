@@ -29,6 +29,14 @@ app = FastAPI(title="Fleet Buddy", version="1.0.0")
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
 
 
+def get_dataset_or_404(dataset_id: str) -> Dataset:
+    with state.STATE_LOCK:
+        dataset = state.DATASETS.get(dataset_id)
+    if dataset is None:
+        raise HTTPException(status_code=404, detail="Dataset not found.")
+    return dataset
+
+
 def resolve_previous_trace(dataset_id: str, trace_id: str | None) -> dict[str, Any] | None:
     if not trace_id:
         return None
@@ -94,10 +102,7 @@ async def upload_dataset(file: UploadFile = File(...)) -> dict[str, Any]:
 
 @app.post("/datasets/{dataset_id}/chat")
 def chat(dataset_id: str, request: ChatRequest, response: Response) -> dict[str, Any]:
-    with state.STATE_LOCK:
-        dataset = state.DATASETS.get(dataset_id)
-    if dataset is None:
-        raise HTTPException(status_code=404, detail="Dataset not found.")
+    dataset = get_dataset_or_404(dataset_id)
     previous_trace = resolve_previous_trace(dataset_id, request.previous_trace_id)
     result = run_chat(dataset, request.messages, previous_trace=previous_trace)
     response.headers["X-Trace-ID"] = result["trace_id"]
@@ -106,10 +111,7 @@ def chat(dataset_id: str, request: ChatRequest, response: Response) -> dict[str,
 
 @app.post("/datasets/{dataset_id}/chat/stream")
 def stream_chat(dataset_id: str, request: ChatRequest) -> StreamingResponse:
-    with state.STATE_LOCK:
-        dataset = state.DATASETS.get(dataset_id)
-    if dataset is None:
-        raise HTTPException(status_code=404, detail="Dataset not found.")
+    dataset = get_dataset_or_404(dataset_id)
     previous_trace = resolve_previous_trace(dataset_id, request.previous_trace_id)
     return StreamingResponse(
         stream_worker(lambda emit: run_chat(dataset, request.messages, previous_trace=previous_trace, on_event=emit)),
@@ -147,10 +149,7 @@ def get_evals() -> list[dict[str, Any]]:
 
 @app.post("/datasets/{dataset_id}/evals")
 def run_evals(dataset_id: str, cases: list[EvalCase]) -> dict[str, Any]:
-    with state.STATE_LOCK:
-        dataset = state.DATASETS.get(dataset_id)
-    if dataset is None:
-        raise HTTPException(status_code=404, detail="Dataset not found.")
+    dataset = get_dataset_or_404(dataset_id)
     results = []
     for index, case in enumerate(cases):
         run = run_chat(dataset, case.messages)
@@ -161,10 +160,7 @@ def run_evals(dataset_id: str, cases: list[EvalCase]) -> dict[str, Any]:
 
 @app.post("/datasets/{dataset_id}/evals/stream")
 def stream_evals(dataset_id: str, cases: list[EvalCase]) -> StreamingResponse:
-    with state.STATE_LOCK:
-        dataset = state.DATASETS.get(dataset_id)
-    if dataset is None:
-        raise HTTPException(status_code=404, detail="Dataset not found.")
+    dataset = get_dataset_or_404(dataset_id)
 
     def worker(emit: ProgressCallback) -> dict[str, Any]:
         results = []
