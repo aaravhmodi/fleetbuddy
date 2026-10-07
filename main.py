@@ -466,6 +466,7 @@ def run_chat(dataset: Dataset, messages: list[Message]) -> dict[str, Any]:
         reply = ""
         for call_number in range(1, MAX_MODEL_CALLS + 1):
             step_start = time.perf_counter()
+            step_started_at = now_iso()
             response = api_client.responses.create(model=MODEL, instructions=prompt, input=input_items, tools=TOOLS)
             input_tokens, output_tokens = usage_values(response)
             trace["input_tokens"] += input_tokens
@@ -478,7 +479,8 @@ def run_chat(dataset: Dataset, messages: list[Message]) -> dict[str, Any]:
                 "type": "model",
                 "name": "responses.create",
                 "call_number": call_number,
-                "started_at": now_iso(),
+                "started_at": step_started_at,
+                "start_offset_ms": round((step_start - started) * 1000, 2),
                 "duration_ms": round((time.perf_counter() - step_start) * 1000, 2),
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
@@ -497,6 +499,7 @@ def run_chat(dataset: Dataset, messages: list[Message]) -> dict[str, Any]:
             input_items.extend(output_items(response))
             for call in calls:
                 tool_started = time.perf_counter()
+                tool_started_at = now_iso()
                 name = str(call.get("name", ""))
                 raw_args = call.get("arguments", "{}")
                 try:
@@ -513,7 +516,8 @@ def run_chat(dataset: Dataset, messages: list[Message]) -> dict[str, Any]:
                     "id": f"step_{len(trace['steps']) + 1}",
                     "type": "tool",
                     "name": name,
-                    "started_at": now_iso(),
+                    "started_at": tool_started_at,
+                    "start_offset_ms": round((tool_started - started) * 1000, 2),
                     "duration_ms": round((time.perf_counter() - tool_started) * 1000, 2),
                     "arguments": json_safe(args),
                     "result": json_safe(result),
