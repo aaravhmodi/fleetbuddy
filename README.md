@@ -10,12 +10,13 @@ python -m venv .venv
 # macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
 
-# Windows PowerShell
-$env:OPENAI_API_KEY = "your-key"
-uvicorn main:app --reload
+# Create a local environment file (Windows PowerShell)
+Copy-Item .env.example .env
+# Then replace the placeholder in .env with your OpenAI API key.
+uvicorn main:app --reload --env-file .env
 ```
 
-Open http://127.0.0.1:8000, upload `robot_runs.csv`, and use the chat and dashboard. The default model is `gpt-4o-mini`; set `OPENAI_MODEL` to override it.
+Open http://127.0.0.1:8000, upload `robot_runs.csv`, and use the chat and dashboard. The default model is `gpt-4o-mini`; set `OPENAI_MODEL` in `.env` to override it. The real `.env` is ignored by Git and must not be committed.
 
 Run the API-key-free tests with:
 
