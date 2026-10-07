@@ -104,7 +104,7 @@ def test_weather_uses_geocoding_and_archive(monkeypatch: pytest.MonkeyPatch, dat
     def fake_get(url: str, *, params: dict[str, object], timeout: float) -> FakeHTTPResponse:
         calls.append((url, params))
         if "geocoding" in url:
-            return FakeHTTPResponse({"results": [{"name": "Toronto", "admin1": "Ontario", "country": "Canada", "latitude": 43.65, "longitude": -79.38}]})
+            return FakeHTTPResponse({"results": [{"name": "Example City", "admin1": "Example Region", "country": "Example Country", "latitude": 1.23, "longitude": 4.56}]})
         return FakeHTTPResponse({
             "daily": {
                 "time": ["2026-06-15"],
@@ -120,7 +120,7 @@ def test_weather_uses_geocoding_and_archive(monkeypatch: pytest.MonkeyPatch, dat
 
     monkeypatch.setattr(main.httpx, "get", fake_get)
     main.WEATHER_CACHE.clear()
-    result = run_get_weather(dataset, {"location": "Toronto, Canada", "date": "2026-06-15"})
+    result = run_get_weather(dataset, {"location": "Example City", "date": "2026-06-15"})
     assert result["source"] == "Open-Meteo historical weather API"
     assert result["rows"][0]["temperature_mean_c"] == 20.1
     assert len(calls) == 2

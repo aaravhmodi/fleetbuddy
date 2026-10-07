@@ -472,7 +472,7 @@ TOOLS = [
         "parameters": {
             "type": "object",
             "properties": {
-                "location": {"type": "string", "description": "City, region, or postal code, such as Toronto, Canada."},
+                "location": {"type": "string", "description": "City, region, or postal code supplied by the user."},
                 "latitude": {"type": "number", "minimum": -90, "maximum": 90},
                 "longitude": {"type": "number", "minimum": -180, "maximum": 180},
                 "date": {"type": "string", "description": "UTC calendar date YYYY-MM-DD"},
