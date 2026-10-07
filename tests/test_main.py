@@ -37,6 +37,31 @@ def test_aggregate_totals_and_filter(dataset: Dataset) -> None:
     assert len(result["rows"]) == 6
 
 
+def test_exclusion_filters_are_applied_server_side(dataset: Dataset) -> None:
+    result = run_aggregate_runs(dataset, {
+        "exclude_states": ["idle"],
+        "exclude_robot_ids": ["MR-06"],
+        "exclude_fields": ["North 40"],
+        "metrics": ["row_count"],
+    })
+    expected = dataset.frame[
+        (dataset.frame["state"] != "idle")
+        & (dataset.frame["robot_id"] != "MR-06")
+        & (dataset.frame["field"] != "North 40")
+    ]
+    assert result["rows"][0]["row_count"] == len(expected)
+    assert result["filters"] == {
+        "exclude_states": ["idle"],
+        "exclude_robot_ids": ["MR-06"],
+        "exclude_fields": ["North 40"],
+    }
+
+
+def test_exclusion_filters_reject_unknown_values(dataset: Dataset) -> None:
+    with pytest.raises(ValueError, match="unsupported"):
+        run_query_runs(dataset, {"exclude_states": ["sleeping"]})
+
+
 def test_server_calculates_efficiency_from_sums(dataset: Dataset) -> None:
     result = run_aggregate_runs(dataset, {
         "robot_id": "MR-04",
@@ -323,6 +348,55 @@ class FakeResponsesClient:
         return next(self._responses)
 
 
+def test_progress_events_are_emitted_in_execution_order(dataset: Dataset, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeResponsesClient([
+        FakeResponse([FakeCall("aggregate_runs", '{"state":"applying","metrics":["row_count"]}')]),
+        FakeResponse([], "The applying interval count came from the tool result."),
+    ])
+    monkeypatch.setattr(main, "client", lambda: fake)
+    monkeypatch.setattr(main, "TRACES", [])
+    events: list[dict[str, object]] = []
+    run_chat(dataset, [main.Message(role="user", content="How many applying intervals are there?")], on_event=events.append)
+    event_names = [event["event"] for event in events]
+    assert event_names[0] == "turn_start"
+    assert event_names[-1] == "turn_complete"
+    assert [event["step"]["type"] for event in events if event["event"] == "step"] == ["model", "tool", "model"]
+    assert any(event.get("label") == "Running tool · aggregate_runs" for event in events)
+    tool_start = next(index for index, event in enumerate(events) if event["event"] == "tool_start")
+    tool_step = next(index for index, event in enumerate(events) if event["event"] == "step" and event["step"]["type"] == "tool")
+    assert tool_start < tool_step
+    assert events[tool_start]["name"] == "aggregate_runs"
+    assert "applying" in events[tool_start]["arguments"]
+
+
+def test_previous_trace_evidence_can_be_reused_without_rerunning_tool(dataset: Dataset, monkeypatch: pytest.MonkeyPatch) -> None:
+    first_fake = FakeResponsesClient([
+        FakeResponse([FakeCall("aggregate_runs", '{"state":"applying","metrics":["row_count"]}')]),
+        FakeResponse([], "There are applying intervals in the dataset."),
+    ])
+    monkeypatch.setattr(main, "client", lambda: first_fake)
+    monkeypatch.setattr(main, "TRACES", [])
+    first = run_chat(dataset, [main.Message(role="user", content="How many applying intervals are there?")])
+
+    second_fake = FakeResponsesClient([FakeResponse([], "The exact prior tool output is shown above.")])
+    monkeypatch.setattr(main, "client", lambda: second_fake)
+    second = run_chat(
+        dataset,
+        [
+            main.Message(role="user", content="How many applying intervals are there?"),
+            main.Message(role="assistant", content=first["reply"]),
+            main.Message(role="user", content="Show me the exact previous tool output."),
+        ],
+        previous_trace=first["trace"],
+    )
+    assert second["trace"]["previous_trace_id"] == first["trace_id"]
+    assert second["trace"]["grounding"]["status"] == "reused_evidence"
+    assert second["trace"]["reused_evidence"] == ["step_2"]
+    assert sum(step["type"] == "tool" for step in second["trace"]["steps"]) == 0
+    assert "PRIOR TURN TOOL EVIDENCE" in str(second_fake.calls[0]["instructions"])
+    assert second["evidence"]["previous_trace_id"] == first["trace_id"]
+
+
 def test_tool_error_is_returned_and_turn_recovers(dataset: Dataset, monkeypatch: pytest.MonkeyPatch) -> None:
     fake = FakeResponsesClient([
         FakeResponse([FakeCall("query_runs", '{"limit": 51}')]),
@@ -389,6 +463,8 @@ def test_weather_follow_up_records_limitation_grounding(dataset: Dataset, monkey
         "required": True,
         "status": "limitation",
         "successful_tool_steps": [],
+        "previous_trace_id": None,
+        "reused_step_ids": [],
     }
 
 

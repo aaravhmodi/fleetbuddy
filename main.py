@@ -10,17 +10,19 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from queue import Queue
+from typing import Any, Callable, Iterator, Literal
 
 import pandas as pd
 import httpx
 from fastapi import FastAPI, File, HTTPException, Response, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
 
+# --- Settings: the CSV shape we accept, which model to use, pricing, and safety limits ---
 EXPECTED_COLUMNS = [
     "ts",
     "robot_id",
@@ -38,11 +40,12 @@ MAX_MODEL_CALLS = 8
 MAX_TOOL_ROWS = 50
 MAX_QUERY_WINDOW_DAYS = 90
 MAX_FILTER_STRING_LENGTH = 64
-PROMPT_VERSION = "fleet-buddy-2026-10-07.3"
+PROMPT_VERSION = "fleet-buddy-2026-10-07.4"
 OPEN_METEO_GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
 OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 
 
+# Shapes of the JSON request bodies. FastAPI checks incoming requests against these automatically.
 class Message(BaseModel):
     role: Literal["user", "assistant"]
     content: str
@@ -50,6 +53,7 @@ class Message(BaseModel):
 
 class ChatRequest(BaseModel):
     messages: list[Message] = Field(min_length=1)
+    previous_trace_id: str | None = None
 
 
 class EvalCase(BaseModel):
@@ -64,6 +68,8 @@ class Dataset:
         self.profile = profile
 
 
+# Everything lives in memory (lost on restart): uploaded datasets, chat traces, and cached
+# location lookups. The lock stops two requests from changing these at the same time.
 DATASETS: dict[str, Dataset] = {}
 TRACES: list[dict[str, Any]] = []
 WEATHER_CACHE: dict[str, dict[str, Any]] = {}
@@ -79,6 +85,7 @@ def now_iso() -> str:
 
 
 def json_safe(value: Any) -> Any:
+    # Turns pandas/numpy values (timestamps, NaN, int64) into plain Python so they can be sent as JSON.
     if isinstance(value, dict):
         return {str(k): json_safe(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
@@ -106,6 +113,8 @@ def model_dump(value: Any) -> dict[str, Any]:
 
 
 def profile_frame(frame: pd.DataFrame) -> dict[str, Any]:
+    # A summary of the dataset (columns, date range, robots, fields). This is what the model
+    # sees in its prompt; it never sees the raw rows.
     type_names: dict[str, str] = {
         "ts": "datetime",
         "robot_id": "string",
@@ -135,6 +144,8 @@ def profile_frame(frame: pd.DataFrame) -> dict[str, Any]:
 
 
 def parse_dataset(raw: bytes) -> tuple[pd.DataFrame, dict[str, Any]]:
+    # Reads the uploaded CSV and rejects wrong columns, bad timestamps, unknown states,
+    # or impossible numbers (e.g. battery over 100%). Blank numbers are allowed.
     if not raw:
         raise ValueError("The CSV file is empty.")
     try:
@@ -212,7 +223,20 @@ def validate_tool_window(args: dict[str, Any]) -> None:
         raise ValueError(f"Time window cannot exceed {MAX_QUERY_WINDOW_DAYS} days.")
 
 
+def string_list_argument(args: dict[str, Any], key: str) -> list[str]:
+    value = args.get(key) or []
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise ValueError(f"{key} must be an array of strings.")
+    if len(value) > 20:
+        raise ValueError(f"{key} supports at most 20 values.")
+    cleaned = [item.strip() for item in value if item.strip()]
+    if any(len(item) > MAX_FILTER_STRING_LENGTH for item in cleaned):
+        raise ValueError(f"{key} values cannot exceed {MAX_FILTER_STRING_LENGTH} characters.")
+    return cleaned
+
+
 def filtered_frame(dataset: Dataset, args: dict[str, Any]) -> pd.DataFrame:
+    # Shared filtering for both data tools: robot, state, field, exclusions, then date or date range.
     validate_tool_window(args)
     frame = dataset.frame
     robot_id = args.get("robot_id")
@@ -229,6 +253,24 @@ def filtered_frame(dataset: Dataset, args: dict[str, Any]) -> pd.DataFrame:
         if field not in valid_fields:
             raise ValueError(f"field must be one of: {', '.join(sorted(valid_fields))}")
         frame = frame[frame["field"] == field]
+    exclude_states = [value.lower() for value in string_list_argument(args, "exclude_states")]
+    invalid_states = sorted(set(exclude_states) - VALID_STATES)
+    if invalid_states:
+        raise ValueError(f"exclude_states contains unsupported value(s): {', '.join(invalid_states)}.")
+    exclude_robot_ids = string_list_argument(args, "exclude_robot_ids")
+    invalid_robots = sorted(set(exclude_robot_ids) - set(dataset.profile.get("robot_ids", [])))
+    if invalid_robots:
+        raise ValueError(f"exclude_robot_ids contains unsupported value(s): {', '.join(invalid_robots)}.")
+    exclude_fields = string_list_argument(args, "exclude_fields")
+    invalid_fields = sorted(set(exclude_fields) - set(dataset.profile.get("fields", [])))
+    if invalid_fields:
+        raise ValueError(f"exclude_fields contains unsupported value(s): {', '.join(invalid_fields)}.")
+    if exclude_states:
+        frame = frame[~frame["state"].isin(exclude_states)]
+    if exclude_robot_ids:
+        frame = frame[~frame["robot_id"].isin(exclude_robot_ids)]
+    if exclude_fields:
+        frame = frame[~frame["field"].isin(exclude_fields)]
     if args.get("date"):
         start = parse_date(str(args["date"]))
         assert start is not None
@@ -263,6 +305,7 @@ def format_rows(frame: pd.DataFrame, limit: int = MAX_TOOL_ROWS, time_frame: pd.
 
 
 def run_query_runs(dataset: Dataset, args: dict[str, Any]) -> dict[str, Any]:
+    # Tool 1: return matching raw rows (max 50), e.g. "when did MR-03 fault?"
     frame = filtered_frame(dataset, args)
     limit = int(args.get("limit", MAX_TOOL_ROWS))
     if limit < 1 or limit > MAX_TOOL_ROWS:
@@ -273,6 +316,8 @@ def run_query_runs(dataset: Dataset, args: dict[str, Any]) -> dict[str, Any]:
 
 
 def run_aggregate_runs(dataset: Dataset, args: dict[str, Any]) -> dict[str, Any]:
+    # Tool 2: totals, averages, and counts, optionally grouped by robot, field, state, or date.
+    # To add a metric, add it to allowed_metrics below AND to the "metrics" enum in TOOLS.
     frame = filtered_frame(dataset, args)
     group_by = args.get("group_by", [])
     if isinstance(group_by, str):
@@ -334,6 +379,8 @@ def run_aggregate_runs(dataset: Dataset, args: dict[str, Any]) -> dict[str, Any]
 
 
 def run_get_weather(dataset: Dataset, args: dict[str, Any]) -> dict[str, Any]:
+    # Tool 3: historical weather or soil moisture from Open-Meteo.
+    # Steps: check inputs -> turn a city name into coordinates -> fetch archive data -> shape into daily rows.
     location = str(args.get("location") or "").strip()
     data_type = str(args.get("data_type") or "weather").strip().lower()
     if data_type not in {"weather", "soil_moisture"}:
@@ -469,6 +516,8 @@ def run_get_weather(dataset: Dataset, args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# Tool descriptions sent to the model. The model reads these to decide which tool to call and
+# with what arguments. Every tool here also needs a matching branch in call_tool().
 TOOLS = [
     {
         "type": "function",
@@ -483,6 +532,9 @@ TOOLS = [
                 "end_date": {"type": "string"},
                 "state": {"type": "string", "enum": sorted(VALID_STATES)},
                 "field": {"type": "string", "description": "Farm field/location, such as North 40, Creekside, or Home Quarter. This is not a metric or CSV column name."},
+                "exclude_states": {"type": "array", "items": {"type": "string", "enum": sorted(VALID_STATES)}, "description": "States to exclude, for questions such as everything except idle."},
+                "exclude_robot_ids": {"type": "array", "items": {"type": "string"}},
+                "exclude_fields": {"type": "array", "items": {"type": "string"}},
                 "limit": {"type": "integer", "minimum": 1, "maximum": MAX_TOOL_ROWS},
             },
             "additionalProperties": False,
@@ -491,7 +543,7 @@ TOOLS = [
     {
         "type": "function",
         "name": "aggregate_runs",
-        "description": "Aggregate robot-run metrics for comparisons, totals, rates, and counts. efficiency_l_per_km is calculated server-side as sum nitrogen_applied_l / sum distance_m * 1000 and is null when distance is missing or zero. robot_count is the distinct robots observed in each group, not a simultaneous headcount. For fleet-wide rankings or trends, omit robot_id and use group_by to get all robots or dates in one call; do not call once per robot unless the user names specific robots. For named-robot comparisons, group by robot_id and select the requested rows. Each source row is a five-minute interval, so row_count for charging can be converted to minutes by multiplying by 5. If both date and start/end dates are supplied, date is treated as the authoritative UTC calendar day.",
+        "description": "Aggregate robot-run metrics for comparisons, totals, rates, and counts. Use exclude_states, exclude_robot_ids, or exclude_fields for requests containing except, excluding, or without. efficiency_l_per_km is calculated server-side as sum nitrogen_applied_l / sum distance_m * 1000 and is null when distance is missing or zero. robot_count is the distinct robots observed in each group, not a simultaneous headcount. For fleet-wide rankings or trends, omit robot_id and use group_by to get all robots or dates in one call; do not call once per robot unless the user names specific robots. For named-robot comparisons, group by robot_id and select the requested rows. Each source row is a five-minute interval, so row_count for charging can be converted to minutes by multiplying by 5. If both date and start/end dates are supplied, date is treated as the authoritative UTC calendar day.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -501,6 +553,9 @@ TOOLS = [
                 "end_date": {"type": "string"},
                 "state": {"type": "string", "enum": sorted(VALID_STATES)},
                 "field": {"type": "string", "description": "Farm field/location, such as North 40, Creekside, or Home Quarter. This is not a metric or CSV column name."},
+                "exclude_states": {"type": "array", "items": {"type": "string", "enum": sorted(VALID_STATES)}, "description": "States to exclude, for questions such as everything except idle."},
+                "exclude_robot_ids": {"type": "array", "items": {"type": "string"}},
+                "exclude_fields": {"type": "array", "items": {"type": "string"}},
                 "group_by": {"type": "array", "items": {"type": "string", "enum": ["robot_id", "field", "state", "date"]}},
                 "metrics": {"type": "array", "items": {"type": "string", "enum": ["sum_nitrogen", "sum_distance", "efficiency_l_per_km", "avg_battery", "max_battery", "min_battery", "row_count", "robot_count"]}},
             },
@@ -528,10 +583,13 @@ TOOLS = [
 ]
 
 
-SYSTEM_PROMPT_TEMPLATE = """You are Fleet Buddy, an accurate analyst for a robot-run CSV.
+# Instructions the model gets on every turn. {profile} is filled with the dataset summary.
+# Bump PROMPT_VERSION when you change this so traces show which prompt was used.
+SYSTEM_PROMPT_TEMPLATE ="""You are Fleet Buddy, an accurate analyst for a robot-run CSV.
 Answer only from tool results. The dataset profile below describes available columns and scope; it deliberately contains no rows.
 If the question asks for information outside the CSV, do not invent facts. Weather and soil moisture can be retrieved from Open-Meteo only when the user supplies a city/location or coordinates; if no location is supplied, clearly ask for it and offer the external lookup. For soil moisture, call get_weather with data_type=soil_moisture and explain that the result is reanalysis rather than an on-farm sensor measurement. Label Open-Meteo results as external historical data and never imply the CSV contained them.
 Use aggregate_runs for totals, comparisons, rates, and counts; use query_runs for exact events and timestamps. For litres applied per kilometre, request the server-side efficiency_l_per_km metric and follow the user's stated scope; do not add a state filter unless the user explicitly names a state. Include sum_nitrogen and sum_distance when the numerator and denominator help explain the result. Never divide by zero or treat a null denominator as zero. `row_count` means five-minute source intervals, not distinct robots or events; use `robot_count` for distinct robots observed in a group and do not present it as simultaneous headcount. State assumptions and units, and round sensibly. If the question asks for an overall metric without naming a state, make one aggregate_runs call with state omitted rather than comparing every state. For lowest/highest average battery on a date, make exactly one call with date, group_by=[robot_id], metrics=[avg_battery], and no state. For a comparison of named robots, make one grouped call with group_by=[robot_id] and select the named rows; do not repeat the same query for every state. For a date efficiency trend, make one call with group_by=[date] and the requested metrics. After a tool result contains the requested comparison rows, answer from it instead of exploring other states. If the user says "full dataset" or "across all three days", omit date and start/end filters.
+For requests containing "except", "excluding", or "without", use the matching exclude_states, exclude_robot_ids, or exclude_fields tool argument. Do not simulate exclusions by subtracting independently rounded answers.
 The CSV column named field means farm field/location. Never put a metric name such as nitrogen_applied_l in field; metric names belong only in metrics.
 Format answers with Markdown: use **bold** for key results, headings with `##`, and bullet lists when useful. For equations, use `\\( ... \\)` for inline math and `$$ ... $$` for display math. For example, write `MR-01: \\(\\frac{{173.05}}{{16901}} \\approx 0.01024\\) L/m`, never `( \\frac{{...}} )` without delimiters. Never use bare `[` and `]` lines to delimit an equation. Do not wrap ordinary text in math delimiters.
 Always state the effective timeframe for time-based answers. If the user did not provide a date or date range, explicitly say "across the full dataset" and include the profile's start and end dates. Never call it a "selected timeframe" unless the user actually selected or supplied one.
@@ -570,6 +628,7 @@ def output_items(response: Any) -> list[dict[str, Any]]:
 
 
 def call_tool(dataset: Dataset, name: str, args: dict[str, Any]) -> dict[str, Any]:
+    # Sends the model's tool request to the matching Python function.
     if name == "query_runs":
         return run_query_runs(dataset, args)
     if name == "aggregate_runs":
@@ -693,6 +752,7 @@ def build_visualization(trace: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def build_evidence(trace: dict[str, Any]) -> dict[str, Any] | None:
+    # The "evidence" box under each answer: which tools ran, date ranges, filters, and row counts.
     tool_steps = [step for step in trace.get("steps", []) if step.get("type") == "tool" and not step.get("error")]
     if not tool_steps:
         grounding = trace.get("grounding")
@@ -769,6 +829,8 @@ def question_date(question: str) -> str | None:
 
 def fallback_aggregate_answer(dataset: Dataset, question: str) -> tuple[str, dict[str, Any], dict[str, Any]] | None:
     """Answer a few high-value analytical shapes if the model exhausts its call budget."""
+    # Note: run_chat calls this after every turn, so when a question matches one of these
+    # patterns, this computed answer replaces the model's answer.
     lowered = question.lower()
     if "state" in lowered and any(state in lowered for state in VALID_STATES):
         return None
@@ -831,6 +893,8 @@ def fallback_aggregate_answer(dataset: Dataset, question: str) -> tuple[str, dic
     return None
 
 
+# Word lists for the grounding check: if the user asks about fleet data, the answer must come
+# from a tool result or clearly say the data can't answer it.
 DATA_QUESTION_TERMS = {
     "robot", "fleet", "nitrogen", "battery", "distance", "fault", "charging",
     "driving", "applying", "idle", "efficiency", "field", "interval", "run",
@@ -858,6 +922,7 @@ def reply_states_limitation(reply: str) -> bool:
 
 
 def ensure_environment_follow_up(messages: list[Message], reply: str, steps: list[dict[str, Any]]) -> str:
+    # If the user asked about weather but no lookup happened, make sure the reply asks for a location.
     user_text = " ".join(message.content.lower() for message in messages if message.role == "user")
     lowered_reply = reply.lower()
     environmental = any(term in user_text for term in ENVIRONMENT_QUERY_TERMS)
@@ -876,13 +941,71 @@ def ensure_environment_follow_up(messages: list[Message], reply: str, steps: lis
     )
 
 
-def run_chat(dataset: Dataset, messages: list[Message]) -> dict[str, Any]:
+ProgressCallback = Callable[[dict[str, Any]], None]
+
+
+def previous_trace_context(previous_trace: dict[str, Any] | None) -> tuple[str, list[dict[str, Any]]]:
+    # Gives the model the previous turn's tool results so follow-ups like "show your work" can reuse them.
+    if not previous_trace:
+        return "", []
+    tool_steps = [
+        {
+            "step_id": step.get("id"),
+            "tool": step.get("name"),
+            "arguments": step.get("arguments"),
+            "result": step.get("result"),
+        }
+        for step in previous_trace.get("steps", [])
+        if step.get("type") == "tool" and not step.get("error")
+    ]
+    if not tool_steps:
+        return "", []
+    context = (
+        "\n\nPRIOR TURN TOOL EVIDENCE:\n"
+        + json.dumps({
+            "trace_id": previous_trace.get("id"),
+            "question": previous_trace.get("question"),
+            "reply": previous_trace.get("reply"),
+            "tool_steps": tool_steps,
+        }, indent=2)
+        + "\nUse this evidence only when the user asks to inspect, explain, or reuse the prior result. "
+        + "For a new scope, date, entity, filter, or metric, call a tool again."
+    )
+    return context, tool_steps
+
+
+def question_requests_evidence_reuse(question: str) -> bool:
+    lowered = question.lower()
+    phrases = (
+        "previous tool", "prior tool", "exact tool", "tool output", "tool result",
+        "show your work", "show the evidence", "support that", "how did you calculate",
+        "how was that calculated", "where did that come from", "same result",
+    )
+    return any(phrase in lowered for phrase in phrases)
+
+
+def run_chat(
+    dataset: Dataset,
+    messages: list[Message],
+    previous_trace: dict[str, Any] | None = None,
+    on_event: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    # The main chat loop: ask the model -> run any tools it asks for -> send results back -> repeat
+    # until it gives a final answer (at most MAX_MODEL_CALLS times). Every step goes into the trace.
+    def emit(event: str, **payload: Any) -> None:
+        if on_event is not None:
+            on_event(json_safe({"event": event, **payload}))
+
+    prior_context, prior_tool_steps = previous_trace_context(previous_trace)
     trace = {
         "id": f"tr_{uuid.uuid4().hex[:12]}",
         "dataset_id": dataset.id,
         "created_at": now_iso(),
         "question": next((message.content for message in reversed(messages) if message.role == "user"), ""),
         "messages": [message.model_dump() for message in messages],
+        "previous_trace_id": previous_trace.get("id") if previous_trace else None,
+        "prior_evidence_step_ids": [step["step_id"] for step in prior_tool_steps],
+        "reused_evidence": [],
         "steps": [],
         "model": MODEL,
         "prompt_version": PROMPT_VERSION,
@@ -904,12 +1027,14 @@ def run_chat(dataset: Dataset, messages: list[Message]) -> dict[str, Any]:
         "grounding": None,
     }
     started = time.perf_counter()
-    prompt = SYSTEM_PROMPT_TEMPLATE.format(profile=json.dumps(dataset.profile, indent=2))
+    prompt = SYSTEM_PROMPT_TEMPLATE.format(profile=json.dumps(dataset.profile, indent=2)) + prior_context
     input_items: list[dict[str, Any]] = [message.model_dump() for message in messages]
+    emit("turn_start", trace_id=trace["id"], question=trace["question"], previous_trace_id=trace["previous_trace_id"])
     try:
         api_client = client()
         reply = ""
         for call_number in range(1, MAX_MODEL_CALLS + 1):
+            emit("status", trace_id=trace["id"], label=f"Calling model · pass {call_number}")
             step_start = time.perf_counter()
             step_started_at = now_iso()
             response = api_client.responses.create(model=MODEL, instructions=prompt, input=input_items, tools=TOOLS)
@@ -936,6 +1061,8 @@ def run_chat(dataset: Dataset, messages: list[Message]) -> dict[str, Any]:
                 "output_text": text_output,
             }
             trace["steps"].append(model_step)
+            emit("step", trace_id=trace["id"], step=model_step)
+            # No tool requests means the model has given its final answer.
             if not calls:
                 reply = normalize_latex_response(text_output.strip())
                 break
@@ -943,6 +1070,7 @@ def run_chat(dataset: Dataset, messages: list[Message]) -> dict[str, Any]:
                 trace["outcome"] = "stopped_at_cap"
                 reply = "I stopped after reaching the model-call limit before I could finish the answer."
                 break
+            # Run each requested tool and add its result to the conversation for the next model call.
             input_items.extend(output_items(response))
             for call in calls:
                 tool_started = time.perf_counter()
@@ -950,6 +1078,9 @@ def run_chat(dataset: Dataset, messages: list[Message]) -> dict[str, Any]:
                 name = str(call.get("name", ""))
                 raw_args = call.get("arguments", "{}")
                 args: dict[str, Any] = {"raw": raw_args}
+                emit("status", trace_id=trace["id"], label=f"Running tool · {name}")
+                # Tell the UI which tool is starting (and with what arguments) before it finishes.
+                emit("tool_start", trace_id=trace["id"], name=name, call_id=call.get("call_id"), arguments=raw_args)
                 try:
                     parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
                     if not isinstance(parsed_args, dict):
@@ -960,7 +1091,7 @@ def run_chat(dataset: Dataset, messages: list[Message]) -> dict[str, Any]:
                 except Exception as exc:  # Tool errors are intentionally returned to the model.
                     result = {"error": str(exc)}
                     tool_error = str(exc)
-                trace["steps"].append({
+                tool_step = {
                     "id": f"step_{len(trace['steps']) + 1}",
                     "type": "tool",
                     "name": name,
@@ -970,7 +1101,9 @@ def run_chat(dataset: Dataset, messages: list[Message]) -> dict[str, Any]:
                     "arguments": json_safe(args),
                     "result": json_safe(result),
                     "error": tool_error,
-                })
+                }
+                trace["steps"].append(tool_step)
+                emit("step", trace_id=trace["id"], step=tool_step)
                 input_items.append({
                     "type": "function_call_output",
                     "call_id": call.get("call_id"),
@@ -982,7 +1115,7 @@ def run_chat(dataset: Dataset, messages: list[Message]) -> dict[str, Any]:
         fallback = fallback_aggregate_answer(dataset, trace["question"])
         if fallback:
             fallback_reply, fallback_args, fallback_result = fallback
-            trace["steps"].append({
+            fallback_step = {
                 "id": f"step_{len(trace['steps']) + 1}",
                 "type": "tool",
                 "name": "aggregate_runs",
@@ -993,7 +1126,9 @@ def run_chat(dataset: Dataset, messages: list[Message]) -> dict[str, Any]:
                 "result": json_safe(fallback_result),
                 "error": None,
                 "fallback": True,
-            })
+            }
+            trace["steps"].append(fallback_step)
+            emit("step", trace_id=trace["id"], step=fallback_step)
             trace["fallback_used"] = True
             trace["outcome"] = "answered"
             reply = fallback_reply
@@ -1003,10 +1138,16 @@ def run_chat(dataset: Dataset, messages: list[Message]) -> dict[str, Any]:
             if step.get("type") == "tool" and not step.get("error")
         ]
         trace["reply"] = ensure_environment_follow_up(messages, trace["reply"], trace["steps"])
+        # Grounding check: a data answer must be backed by a tool result, reused evidence,
+        # or an honest "can't answer". Otherwise replace it instead of letting the model guess.
         required = grounding_required(messages)
         limitation = reply_states_limitation(trace["reply"])
+        reuse_requested = bool(prior_tool_steps) and question_requests_evidence_reuse(trace["question"])
         if successful_tools:
             grounding_status = "grounded"
+        elif reuse_requested:
+            grounding_status = "reused_evidence"
+            trace["reused_evidence"] = list(trace["prior_evidence_step_ids"])
         elif required and limitation:
             grounding_status = "limitation"
         elif required:
@@ -1019,6 +1160,8 @@ def run_chat(dataset: Dataset, messages: list[Message]) -> dict[str, Any]:
             "required": required,
             "status": grounding_status,
             "successful_tool_steps": [step["id"] for step in successful_tools],
+            "previous_trace_id": trace["previous_trace_id"] if reuse_requested else None,
+            "reused_step_ids": trace["reused_evidence"],
         }
     except Exception as exc:
         trace["outcome"] = "failed"
@@ -1029,8 +1172,19 @@ def run_chat(dataset: Dataset, messages: list[Message]) -> dict[str, Any]:
             "status": "failed",
             "successful_tool_steps": [],
         }
-    trace["visualization"] = build_visualization(trace)
-    trace["evidence"] = build_evidence(trace)
+    if (trace.get("grounding") or {}).get("status") == "reused_evidence" and previous_trace:
+        trace["visualization"] = previous_trace.get("visualization")
+        prior_evidence = dict(previous_trace.get("evidence") or {})
+        prior_evidence.update({
+            "grounding": trace["grounding"],
+            "previous_trace_id": trace["previous_trace_id"],
+            "reused_evidence": True,
+        })
+        trace["evidence"] = prior_evidence
+    else:
+        trace["visualization"] = build_visualization(trace)
+        trace["evidence"] = build_evidence(trace)
+    # Final timing numbers, then save the trace so /traces and /analytics can see it.
     trace["duration_ms"] = round((time.perf_counter() - started) * 1000, 2)
     step_duration_ms = round(sum(float(step.get("duration_ms", 0)) for step in trace["steps"]), 2)
     trace["step_duration_ms"] = step_duration_ms
@@ -1041,7 +1195,9 @@ def run_chat(dataset: Dataset, messages: list[Message]) -> dict[str, Any]:
     trace["cost"] = round(trace["cost"], 8)
     with STATE_LOCK:
         TRACES.append(trace)
-    return {"reply": trace["reply"], "trace_id": trace["id"], "visualization": trace["visualization"], "evidence": trace["evidence"], "trace": trace}
+    result = {"reply": trace["reply"], "trace_id": trace["id"], "visualization": trace["visualization"], "evidence": trace["evidence"], "trace": trace}
+    emit("turn_complete", trace_id=trace["id"], outcome=trace["outcome"], duration_ms=trace["duration_ms"])
+    return result
 
 
 def normalize_text(value: str) -> str:
@@ -1098,6 +1254,8 @@ def paired_facts_are_present(actual: str, expected: str) -> tuple[bool, str | No
 
 
 def score_reply(reply: str, expected: str) -> tuple[bool, str]:
+    # Eval scorer (no extra LLM call): the reply must contain the expected numbers and robot IDs,
+    # plus most of the expected words.
     actual = normalize_text(reply)
     target = normalize_text(expected)
     if not actual:
@@ -1139,6 +1297,8 @@ def summarize_trace(trace: dict[str, Any]) -> dict[str, Any]:
         "tool_calls": sum(step["type"] == "tool" for step in trace["steps"]),
         "fallback_used": bool(trace.get("fallback_used")),
         "grounding_status": (trace.get("grounding") or {}).get("status"),
+        "previous_trace_id": trace.get("previous_trace_id"),
+        "reused_evidence": bool(trace.get("reused_evidence")),
         "untraced_duration_ms": trace.get("untraced_duration_ms", 0.0),
         "timing_coverage_pct": trace.get("timing_coverage_pct", 0.0),
     }
@@ -1153,6 +1313,7 @@ def percentile(values: list[float], percentile_value: float) -> float:
 
 
 def analytics() -> dict[str, Any]:
+    # Dashboard totals across all traces: tokens, cost, latency, failure rates, per-tool counts.
     with STATE_LOCK:
         traces = list(TRACES)
     model_steps = [step for trace in traces for step in trace["steps"] if step["type"] == "model"]
@@ -1187,9 +1348,65 @@ def analytics() -> dict[str, Any]:
     }
 
 
+def resolve_previous_trace(dataset_id: str, trace_id: str | None) -> dict[str, Any] | None:
+    if not trace_id:
+        return None
+    with STATE_LOCK:
+        trace = next((item for item in TRACES if item["id"] == trace_id), None)
+    if trace is None:
+        raise HTTPException(status_code=404, detail="Previous trace not found.")
+    if trace["dataset_id"] != dataset_id:
+        raise HTTPException(status_code=400, detail="Previous trace belongs to a different dataset.")
+    return trace
+
+
+def stream_worker(worker: Callable[[ProgressCallback], Any]) -> Iterator[str]:
+    # Runs the work in a background thread and streams its progress to the browser, one JSON line per event.
+    events: Queue[Any] = Queue()
+    finished = object()
+
+    def emit(event: dict[str, Any]) -> None:
+        events.put(event)
+
+    def target() -> None:
+        try:
+            result = worker(emit)
+            events.put({"event": "done", "result": json_safe(result)})
+        except Exception as exc:
+            events.put({"event": "error", "message": str(exc)})
+        finally:
+            events.put(finished)
+
+    threading.Thread(target=target, daemon=True).start()
+    while True:
+        event = events.get()
+        if event is finished:
+            break
+        yield json.dumps(json_safe(event), separators=(",", ":")) + "\n"
+
+
+def evaluation_result(index: int, case: EvalCase, run: dict[str, Any], include_trace: bool = False) -> dict[str, Any]:
+    passed, reason = score_reply(run["reply"], case.expected)
+    result = {
+        "index": index,
+        "passed": passed,
+        "reason": reason,
+        "expected": case.expected,
+        "reply": run["reply"],
+        "visualization": run["visualization"],
+        "evidence": run["evidence"],
+        "trace_id": run["trace_id"],
+    }
+    if include_trace:
+        result["trace"] = run["trace"]
+    return result
+
+
+# --- HTTP endpoints ---
 @app.get("/")
 def index() -> FileResponse:
-    return FileResponse(Path(__file__).parent / "static" / "index.html")
+    # no-store so the browser always loads the latest UI instead of a cached copy.
+    return FileResponse(Path(__file__).parent / "static" / "index.html", headers={"Cache-Control": "no-store"})
 
 
 @app.get("/health")
@@ -1217,9 +1434,24 @@ def chat(dataset_id: str, request: ChatRequest, response: Response) -> dict[str,
         dataset = DATASETS.get(dataset_id)
     if dataset is None:
         raise HTTPException(status_code=404, detail="Dataset not found.")
-    result = run_chat(dataset, request.messages)
+    previous_trace = resolve_previous_trace(dataset_id, request.previous_trace_id)
+    result = run_chat(dataset, request.messages, previous_trace=previous_trace)
     response.headers["X-Trace-ID"] = result["trace_id"]
     return {"reply": result["reply"], "trace_id": result["trace_id"], "visualization": result["visualization"], "evidence": result["evidence"]}
+
+
+@app.post("/datasets/{dataset_id}/chat/stream")
+def stream_chat(dataset_id: str, request: ChatRequest) -> StreamingResponse:
+    with STATE_LOCK:
+        dataset = DATASETS.get(dataset_id)
+    if dataset is None:
+        raise HTTPException(status_code=404, detail="Dataset not found.")
+    previous_trace = resolve_previous_trace(dataset_id, request.previous_trace_id)
+    return StreamingResponse(
+        stream_worker(lambda emit: run_chat(dataset, request.messages, previous_trace=previous_trace, on_event=emit)),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.get("/traces")
@@ -1258,16 +1490,41 @@ def run_evals(dataset_id: str, cases: list[EvalCase]) -> dict[str, Any]:
     results = []
     for index, case in enumerate(cases):
         run = run_chat(dataset, case.messages)
-        passed, reason = score_reply(run["reply"], case.expected)
-        results.append({
-            "index": index,
-            "passed": passed,
-            "reason": reason,
-            "expected": case.expected,
-            "reply": run["reply"],
-            "visualization": run["visualization"],
-            "evidence": run["evidence"],
-            "trace_id": run["trace_id"],
-        })
+        results.append(evaluation_result(index, case, run))
     passed_count = sum(result["passed"] for result in results)
     return {"pass_rate": round(passed_count / len(results), 4) if results else 0.0, "passed": passed_count, "total": len(results), "results": results}
+
+
+@app.post("/datasets/{dataset_id}/evals/stream")
+def stream_evals(dataset_id: str, cases: list[EvalCase]) -> StreamingResponse:
+    with STATE_LOCK:
+        dataset = DATASETS.get(dataset_id)
+    if dataset is None:
+        raise HTTPException(status_code=404, detail="Dataset not found.")
+
+    def worker(emit: ProgressCallback) -> dict[str, Any]:
+        results = []
+        for index, case in enumerate(cases):
+            question = next((message.content for message in reversed(case.messages) if message.role == "user"), "")
+            emit({"event": "case_start", "case_index": index, "total": len(cases), "question": question})
+
+            def case_event(event: dict[str, Any]) -> None:
+                emit({**event, "case_index": index, "total": len(cases)})
+
+            run = run_chat(dataset, case.messages, on_event=case_event)
+            result = evaluation_result(index, case, run, include_trace=True)
+            results.append(result)
+            emit({"event": "case_result", "case_index": index, "total": len(cases), "result": result})
+        passed_count = sum(result["passed"] for result in results)
+        return {
+            "pass_rate": round(passed_count / len(results), 4) if results else 0.0,
+            "passed": passed_count,
+            "total": len(results),
+            "results": results,
+        }
+
+    return StreamingResponse(
+        stream_worker(worker),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
