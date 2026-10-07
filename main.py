@@ -329,7 +329,7 @@ Answer only from tool results. The dataset profile below describes available col
 If the question asks for information outside the profile/data (for example weather), say clearly that the dataset cannot answer it. Do not invent facts.
 Use aggregate_runs for totals, comparisons, rates, and counts; use query_runs for exact events and timestamps. When calculating litres per kilometre, sum litres divided by sum metres times 1000. State assumptions and units, and round sensibly.
 The CSV column named field means farm field/location. Never put a metric name such as nitrogen_applied_l in field; metric names belong only in metrics.
-Format answers with Markdown: use **bold** for key results, headings with `##`, and bullet lists when useful. For equations, use LaTeX delimiters such as `\\( ... \\)` for inline math or `\\[ ... \\]` for display math. Do not wrap ordinary text in math delimiters.
+Format answers with Markdown: use **bold** for key results, headings with `##`, and bullet lists when useful. For equations, use `\\( ... \\)` for inline math and `$$ ... $$` for display math. Never use bare `[` and `]` lines to delimit an equation. Do not wrap ordinary text in math delimiters.
 Always state the effective timeframe for time-based answers. If the user did not provide a date or date range, explicitly say "across the full dataset" and include the profile's start and end dates. Never call it a "selected timeframe" unless the user actually selected or supplied one.
 For fleet-wide rankings, totals by robot, and trends, make one aggregate_runs call with robot_id omitted and group_by set to robot_id or date. Use separate calls only when comparing explicitly named robots or when the first result is insufficient.
 
