@@ -1,4 +1,5 @@
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pandas as pd
@@ -180,6 +181,7 @@ def test_scoring_requires_key_facts() -> None:
     assert score_reply("The fleet total was 1,012.0 L.", "1012.00 L")[0]
     assert score_reply("Creekside covered 11,036 m.", "Creekside, 11036 m")[0]
     assert not score_reply("MR-01 averaged 57.24%.", "MR-01, 57.13%")[0]
+    assert not score_reply("MR-03 had 3 faults and MR-05 had 4 faults.", "MR-03 4 faults; MR-05 3 faults")[0]
 
 
 def test_aggregate_result_creates_visualization() -> None:
@@ -256,6 +258,8 @@ class FakeResponse:
         self.output = output
         self.output_text = output_text
         self.usage = type("Usage", (), {"input_tokens": 3, "output_tokens": 2})()
+        self.id = f"resp_{id(self)}"
+        self.status = "completed"
 
 
 class FakeResponsesClient:
@@ -283,6 +287,61 @@ def test_tool_error_is_returned_and_turn_recovers(dataset: Dataset, monkeypatch:
     assert result["trace"]["steps"][1]["result"]["error"]
 
 
+@pytest.mark.parametrize(
+    ("call", "error_fragment"),
+    [
+        (FakeCall("query_runs", "{not-json"), "Expecting property name"),
+        (FakeCall("missing_tool", "{}"), "Unknown tool"),
+    ],
+)
+def test_malformed_or_unknown_tool_is_traced_and_recoverable(
+    dataset: Dataset,
+    monkeypatch: pytest.MonkeyPatch,
+    call: FakeCall,
+    error_fragment: str,
+) -> None:
+    fake = FakeResponsesClient([
+        FakeResponse([call]),
+        FakeResponse([], "I could not use that tool call, so I did not invent an answer."),
+    ])
+    monkeypatch.setattr(main, "client", lambda: fake)
+    monkeypatch.setattr(main, "TRACES", [])
+    result = run_chat(dataset, [main.Message(role="user", content="Show me the runs")])
+    tool_step = result["trace"]["steps"][1]
+    assert error_fragment in tool_step["error"]
+    assert tool_step["result"]["error"] == tool_step["error"]
+    if call.arguments == "{not-json":
+        assert tool_step["arguments"] == {"raw": "{not-json"}
+
+
+def test_data_answer_without_tool_evidence_is_blocked(dataset: Dataset, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeResponsesClient([FakeResponse([], "MR-04 is definitely the best robot.")])
+    monkeypatch.setattr(main, "client", lambda: fake)
+    monkeypatch.setattr(main, "TRACES", [])
+    result = run_chat(dataset, [main.Message(role="user", content="Which robot is best?")])
+    assert result["trace"]["outcome"] == "ungrounded"
+    assert result["trace"]["grounding"]["status"] == "missing_tool_evidence"
+    assert "won't guess" in result["reply"]
+
+
+def test_weather_follow_up_records_limitation_grounding(dataset: Dataset, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeResponsesClient([
+        FakeResponse([], "For June 14, the CSV contains no weather data. Please provide a location."),
+    ])
+    monkeypatch.setattr(main, "client", lambda: fake)
+    monkeypatch.setattr(main, "TRACES", [])
+    result = run_chat(dataset, [
+        main.Message(role="user", content="What was the weather on June 15?"),
+        main.Message(role="assistant", content="The CSV contains no weather data."),
+        main.Message(role="user", content="And the day before?"),
+    ])
+    assert result["trace"]["grounding"] == {
+        "required": True,
+        "status": "limitation",
+        "successful_tool_steps": [],
+    }
+
+
 def test_turn_stops_at_eight_model_calls(dataset: Dataset, monkeypatch: pytest.MonkeyPatch) -> None:
     fake = FakeResponsesClient([FakeResponse([FakeCall("aggregate_runs", "{}", f"call_{i}")]) for i in range(8)])
     monkeypatch.setattr(main, "client", lambda: fake)
@@ -301,6 +360,34 @@ def test_separate_turns_have_separate_trace_ids_and_ordered_offsets(dataset: Dat
     assert first["trace_id"] != second["trace_id"]
     assert first["trace"]["steps"][0]["start_offset_ms"] >= 0
     assert second["trace"]["steps"][0]["start_offset_ms"] >= 0
+
+
+def test_concurrent_turns_keep_trace_state_separate(dataset: Dataset, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(main, "client", lambda: FakeResponsesClient([FakeResponse([], "Hello.")]))
+    monkeypatch.setattr(main, "TRACES", [])
+    questions = [f"hello {index}" for index in range(12)]
+
+    def invoke(question: str) -> dict[str, object]:
+        return run_chat(dataset, [main.Message(role="user", content=question)])
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        results = list(executor.map(invoke, questions))
+    assert len({result["trace_id"] for result in results}) == len(questions)
+    assert {trace["question"] for trace in main.TRACES} == set(questions)
+
+
+def test_trace_timing_tokens_and_cost_reconcile(dataset: Dataset, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeResponsesClient([FakeResponse([], "Hello.")])
+    monkeypatch.setattr(main, "client", lambda: fake)
+    monkeypatch.setattr(main, "TRACES", [])
+    trace = run_chat(dataset, [main.Message(role="user", content="hello")])["trace"]
+    assert trace["input_tokens"] == sum(step.get("input_tokens", 0) for step in trace["steps"])
+    assert trace["output_tokens"] == sum(step.get("output_tokens", 0) for step in trace["steps"])
+    assert trace["cost"] == pytest.approx(sum(step.get("cost", 0) for step in trace["steps"]))
+    assert trace["duration_ms"] == pytest.approx(trace["step_duration_ms"] + trace["untraced_duration_ms"], abs=0.02)
+    assert 0 <= trace["timing_coverage_pct"] <= 100
+    assert trace["messages"] == [{"role": "user", "content": "hello"}]
+    assert trace["steps"][0]["response_id"].startswith("resp_")
 
 
 def test_follow_up_sends_full_conversation_history(dataset: Dataset, monkeypatch: pytest.MonkeyPatch) -> None:

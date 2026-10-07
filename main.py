@@ -5,6 +5,7 @@ import json
 import math
 import os
 import re
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -37,6 +38,7 @@ MAX_MODEL_CALLS = 8
 MAX_TOOL_ROWS = 50
 MAX_QUERY_WINDOW_DAYS = 90
 MAX_FILTER_STRING_LENGTH = 64
+PROMPT_VERSION = "fleet-buddy-2026-10-07.2"
 OPEN_METEO_GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
 OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 
@@ -65,6 +67,7 @@ class Dataset:
 DATASETS: dict[str, Dataset] = {}
 TRACES: list[dict[str, Any]] = []
 WEATHER_CACHE: dict[str, dict[str, Any]] = {}
+STATE_LOCK = threading.RLock()
 
 
 app = FastAPI(title="Fleet Buddy", version="1.0.0")
@@ -363,7 +366,8 @@ def run_get_weather(dataset: Dataset, args: dict[str, Any]) -> dict[str, Any]:
 
     if location:
         cache_key = json.dumps({"location": location.lower()}, sort_keys=True)
-        geocoded = WEATHER_CACHE.get(cache_key)
+        with STATE_LOCK:
+            geocoded = WEATHER_CACHE.get(cache_key)
         if geocoded is None:
             response = httpx.get(OPEN_METEO_GEOCODING_URL, params={"name": location, "count": 1, "language": "en", "format": "json"}, timeout=10.0)
             response.raise_for_status()
@@ -379,7 +383,8 @@ def run_get_weather(dataset: Dataset, args: dict[str, Any]) -> dict[str, Any]:
                 "latitude": float(match["latitude"]),
                 "longitude": float(match["longitude"]),
             }
-            WEATHER_CACHE[cache_key] = geocoded
+            with STATE_LOCK:
+                WEATHER_CACHE[cache_key] = geocoded
         latitude = geocoded["latitude"]
         longitude = geocoded["longitude"]
         resolved_location = ", ".join(part for part in [geocoded.get("name"), geocoded.get("admin1"), geocoded.get("country")] if part)
@@ -637,7 +642,20 @@ def build_visualization(trace: dict[str, Any]) -> dict[str, Any] | None:
 def build_evidence(trace: dict[str, Any]) -> dict[str, Any] | None:
     tool_steps = [step for step in trace.get("steps", []) if step.get("type") == "tool" and not step.get("error")]
     if not tool_steps:
-        return None
+        grounding = trace.get("grounding")
+        if not grounding:
+            return None
+        return {
+            "tools": [],
+            "step_ids": [],
+            "effective_time_ranges": [],
+            "filters": [],
+            "sources": [],
+            "result_rows": 0,
+            "truncated": False,
+            "fallback_used": bool(trace.get("fallback_used")),
+            "grounding": grounding,
+        }
     ranges = []
     filters = []
     sources = []
@@ -661,6 +679,8 @@ def build_evidence(trace: dict[str, Any]) -> dict[str, Any] | None:
         "sources": sources,
         "result_rows": result_rows,
         "truncated": truncated,
+        "fallback_used": bool(trace.get("fallback_used")),
+        "grounding": trace.get("grounding"),
     }
 
 
@@ -758,14 +778,45 @@ def fallback_aggregate_answer(dataset: Dataset, question: str) -> tuple[str, dic
     return None
 
 
+DATA_QUESTION_TERMS = {
+    "robot", "fleet", "nitrogen", "battery", "distance", "fault", "charging",
+    "driving", "applying", "idle", "efficiency", "field", "interval", "run",
+    "weather", "temperature", "rain", "precipitation", "soil", "moisture",
+}
+LIMITATION_PHRASES = (
+    "cannot answer", "can't answer", "could not answer", "not available", "isn't available",
+    "not included", "contains no", "need a location", "provide a location", "what city",
+    "what location", "coordinates should i use", "cannot determine", "can't determine",
+    "could not use",
+)
+
+
+def grounding_required(messages: list[Message]) -> bool:
+    user_text = " ".join(message.content.lower() for message in messages if message.role == "user")
+    return any(re.search(rf"\b{re.escape(term)}s?\b", user_text) for term in DATA_QUESTION_TERMS)
+
+
+def reply_states_limitation(reply: str) -> bool:
+    lowered = reply.lower().replace("’", "'")
+    return any(phrase in lowered for phrase in LIMITATION_PHRASES)
+
+
 def run_chat(dataset: Dataset, messages: list[Message]) -> dict[str, Any]:
     trace = {
         "id": f"tr_{uuid.uuid4().hex[:12]}",
         "dataset_id": dataset.id,
         "created_at": now_iso(),
         "question": next((message.content for message in reversed(messages) if message.role == "user"), ""),
+        "messages": [message.model_dump() for message in messages],
         "steps": [],
         "model": MODEL,
+        "prompt_version": PROMPT_VERSION,
+        "model_config": {
+            "max_model_calls": MAX_MODEL_CALLS,
+            "tool_names": [tool["name"] for tool in TOOLS],
+            "input_price_per_token": INPUT_PRICE_PER_TOKEN,
+            "output_price_per_token": OUTPUT_PRICE_PER_TOKEN,
+        },
         "outcome": "answered",
         "reply": "",
         "input_tokens": 0,
@@ -774,6 +825,8 @@ def run_chat(dataset: Dataset, messages: list[Message]) -> dict[str, Any]:
         "duration_ms": 0.0,
         "visualization": None,
         "evidence": None,
+        "fallback_used": False,
+        "grounding": None,
     }
     started = time.perf_counter()
     prompt = SYSTEM_PROMPT_TEMPLATE.format(profile=json.dumps(dataset.profile, indent=2))
@@ -802,6 +855,8 @@ def run_chat(dataset: Dataset, messages: list[Message]) -> dict[str, Any]:
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
                 "cost": round(input_tokens * INPUT_PRICE_PER_TOKEN + output_tokens * OUTPUT_PRICE_PER_TOKEN, 8),
+                "response_id": getattr(response, "id", None),
+                "response_status": getattr(response, "status", None),
                 "function_calls": [{"name": c.get("name"), "call_id": c.get("call_id")} for c in calls],
                 "output_text": text_output,
             }
@@ -819,14 +874,15 @@ def run_chat(dataset: Dataset, messages: list[Message]) -> dict[str, Any]:
                 tool_started_at = now_iso()
                 name = str(call.get("name", ""))
                 raw_args = call.get("arguments", "{}")
+                args: dict[str, Any] = {"raw": raw_args}
                 try:
-                    args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-                    if not isinstance(args, dict):
+                    parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                    if not isinstance(parsed_args, dict):
                         raise ValueError("Tool arguments must be a JSON object.")
+                    args = parsed_args
                     result = call_tool(dataset, name, args)
                     tool_error = None
                 except Exception as exc:  # Tool errors are intentionally returned to the model.
-                    args = args if "args" in locals() and isinstance(args, dict) else {"raw": raw_args}
                     result = {"error": str(exc)}
                     tool_error = str(exc)
                 trace["steps"].append({
@@ -867,15 +923,48 @@ def run_chat(dataset: Dataset, messages: list[Message]) -> dict[str, Any]:
             trace["outcome"] = "answered"
             reply = fallback_reply
         trace["reply"] = reply or "I could not produce an answer from the available data."
+        successful_tools = [
+            step for step in trace["steps"]
+            if step.get("type") == "tool" and not step.get("error")
+        ]
+        required = grounding_required(messages)
+        limitation = reply_states_limitation(trace["reply"])
+        if successful_tools:
+            grounding_status = "grounded"
+        elif required and limitation:
+            grounding_status = "limitation"
+        elif required:
+            grounding_status = "missing_tool_evidence"
+            trace["outcome"] = "ungrounded"
+            trace["reply"] = "I couldn't verify that answer from tool results, so I won't guess."
+        else:
+            grounding_status = "not_required"
+        trace["grounding"] = {
+            "required": required,
+            "status": grounding_status,
+            "successful_tool_steps": [step["id"] for step in successful_tools],
+        }
     except Exception as exc:
         trace["outcome"] = "failed"
         trace["error"] = str(exc)
         trace["reply"] = "I couldn't complete that turn. Please check the server configuration and try again."
+        trace["grounding"] = {
+            "required": grounding_required(messages),
+            "status": "failed",
+            "successful_tool_steps": [],
+        }
     trace["visualization"] = build_visualization(trace)
     trace["evidence"] = build_evidence(trace)
     trace["duration_ms"] = round((time.perf_counter() - started) * 1000, 2)
+    step_duration_ms = round(sum(float(step.get("duration_ms", 0)) for step in trace["steps"]), 2)
+    trace["step_duration_ms"] = step_duration_ms
+    trace["untraced_duration_ms"] = round(max(0.0, trace["duration_ms"] - step_duration_ms), 2)
+    trace["timing_coverage_pct"] = round(
+        min(100.0, step_duration_ms / trace["duration_ms"] * 100), 2
+    ) if trace["duration_ms"] else 100.0
     trace["cost"] = round(trace["cost"], 8)
-    TRACES.append(trace)
+    with STATE_LOCK:
+        TRACES.append(trace)
     return {"reply": trace["reply"], "trace_id": trace["id"], "visualization": trace["visualization"], "evidence": trace["evidence"], "trace": trace}
 
 
@@ -904,6 +993,34 @@ def fact_is_present(token: str, actual: str, actual_numbers: list[float]) -> boo
     return token in actual
 
 
+def paired_facts_are_present(actual: str, expected: str) -> tuple[bool, str | None]:
+    """Keep IDs associated with their expected values instead of matching facts anywhere."""
+    actual_id_matches = list(re.finditer(r"mr-\d{2}", actual))
+    for raw_clause in re.split(r"[;\n]", expected):
+        tokens = normalize_text(raw_clause).split()
+        identifiers = [token for token in tokens if re.fullmatch(r"mr-\d{2}", token)]
+        expected_numbers = [numeric_fact_value(token) for token in tokens if numeric_fact_value(token) is not None]
+        if not identifiers or not expected_numbers:
+            continue
+        for identifier in identifiers:
+            found_pair = False
+            for index, match in enumerate(actual_id_matches):
+                if match.group(0) != identifier:
+                    continue
+                segment_end = actual_id_matches[index + 1].start() if index + 1 < len(actual_id_matches) else min(len(actual), match.end() + 300)
+                segment = actual[match.start():segment_end]
+                segment_numbers = [
+                    float(number.group(0).rstrip("%").replace(",", ""))
+                    for number in NUMERIC_VALUE_RE.finditer(segment)
+                ]
+                if all(any(abs(value - candidate) <= 0.01 for candidate in segment_numbers) for value in expected_numbers):
+                    found_pair = True
+                    break
+            if not found_pair:
+                return False, f"expected fact pairing not found: {identifier} with {', '.join(str(value) for value in expected_numbers)}"
+    return True, None
+
+
 def score_reply(reply: str, expected: str) -> tuple[bool, str]:
     actual = normalize_text(reply)
     target = normalize_text(expected)
@@ -911,6 +1028,9 @@ def score_reply(reply: str, expected: str) -> tuple[bool, str]:
         return False, "empty reply"
     if target in actual:
         return True, "expected answer found in reply"
+    paired, pairing_reason = paired_facts_are_present(actual, expected)
+    if not paired:
+        return False, pairing_reason or "expected fact pairing not found"
     target_tokens = [token for token in target.split() if token not in {"the", "a", "an", "is", "was", "of", "on", "and", "to", "in", "for", "with"}]
     numeric_or_ids = [token for token in target_tokens if any(character.isdigit() for character in token) or token.startswith("mr-")]
     actual_numbers = [
@@ -941,6 +1061,10 @@ def summarize_trace(trace: dict[str, Any]) -> dict[str, Any]:
         "cost": trace["cost"],
         "model_calls": sum(step["type"] == "model" for step in trace["steps"]),
         "tool_calls": sum(step["type"] == "tool" for step in trace["steps"]),
+        "fallback_used": bool(trace.get("fallback_used")),
+        "grounding_status": (trace.get("grounding") or {}).get("status"),
+        "untraced_duration_ms": trace.get("untraced_duration_ms", 0.0),
+        "timing_coverage_pct": trace.get("timing_coverage_pct", 0.0),
     }
 
 
@@ -953,7 +1077,8 @@ def percentile(values: list[float], percentile_value: float) -> float:
 
 
 def analytics() -> dict[str, Any]:
-    traces = list(TRACES)
+    with STATE_LOCK:
+        traces = list(TRACES)
     model_steps = [step for trace in traces for step in trace["steps"] if step["type"] == "model"]
     tool_steps = [step for trace in traces for step in trace["steps"] if step["type"] == "tool"]
     by_tool: dict[str, Any] = {}
@@ -964,6 +1089,8 @@ def analytics() -> dict[str, Any]:
         item["errors"] += int(bool(step.get("error")))
     failed = sum(trace["outcome"] == "failed" for trace in traces)
     stopped = sum(trace["outcome"] == "stopped_at_cap" for trace in traces)
+    ungrounded = sum(trace["outcome"] == "ungrounded" for trace in traces)
+    fallback_count = sum(bool(trace.get("fallback_used")) for trace in traces)
     latencies = [trace["duration_ms"] for trace in traces]
     return {
         "turns": len(traces),
@@ -978,6 +1105,8 @@ def analytics() -> dict[str, Any]:
         "p95_turn_latency_ms": percentile(latencies, 0.95),
         "failed_share": round(failed / len(traces), 4) if traces else 0.0,
         "stopped_at_cap_share": round(stopped / len(traces), 4) if traces else 0.0,
+        "ungrounded_share": round(ungrounded / len(traces), 4) if traces else 0.0,
+        "fallback_share": round(fallback_count / len(traces), 4) if traces else 0.0,
         "price_per_million_tokens": {"input": INPUT_PRICE_PER_TOKEN * 1_000_000, "output": OUTPUT_PRICE_PER_TOKEN * 1_000_000},
     }
 
@@ -985,6 +1114,12 @@ def analytics() -> dict[str, Any]:
 @app.get("/")
 def index() -> FileResponse:
     return FileResponse(Path(__file__).parent / "static" / "index.html")
+
+
+@app.get("/health")
+def health() -> dict[str, Any]:
+    with STATE_LOCK:
+        return {"status": "ok", "datasets": len(DATASETS), "traces": len(TRACES)}
 
 
 @app.post("/datasets")
@@ -995,13 +1130,15 @@ async def upload_dataset(file: UploadFile = File(...)) -> dict[str, Any]:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     dataset_id = f"ds_{uuid.uuid4().hex[:10]}"
-    DATASETS[dataset_id] = Dataset(dataset_id, frame, profile)
+    with STATE_LOCK:
+        DATASETS[dataset_id] = Dataset(dataset_id, frame, profile)
     return {"dataset_id": dataset_id, "profile": profile}
 
 
 @app.post("/datasets/{dataset_id}/chat")
 def chat(dataset_id: str, request: ChatRequest, response: Response) -> dict[str, Any]:
-    dataset = DATASETS.get(dataset_id)
+    with STATE_LOCK:
+        dataset = DATASETS.get(dataset_id)
     if dataset is None:
         raise HTTPException(status_code=404, detail="Dataset not found.")
     result = run_chat(dataset, request.messages)
@@ -1011,12 +1148,15 @@ def chat(dataset_id: str, request: ChatRequest, response: Response) -> dict[str,
 
 @app.get("/traces")
 def list_traces() -> list[dict[str, Any]]:
-    return [summarize_trace(trace) for trace in reversed(TRACES)]
+    with STATE_LOCK:
+        traces = list(TRACES)
+    return [summarize_trace(trace) for trace in reversed(traces)]
 
 
 @app.get("/traces/{trace_id}")
 def get_trace(trace_id: str) -> dict[str, Any]:
-    trace = next((trace for trace in TRACES if trace["id"] == trace_id), None)
+    with STATE_LOCK:
+        trace = next((trace for trace in TRACES if trace["id"] == trace_id), None)
     if trace is None:
         raise HTTPException(status_code=404, detail="Trace not found.")
     return trace
@@ -1035,7 +1175,8 @@ def get_evals() -> list[dict[str, Any]]:
 
 @app.post("/datasets/{dataset_id}/evals")
 def run_evals(dataset_id: str, cases: list[EvalCase]) -> dict[str, Any]:
-    dataset = DATASETS.get(dataset_id)
+    with STATE_LOCK:
+        dataset = DATASETS.get(dataset_id)
     if dataset is None:
         raise HTTPException(status_code=404, detail="Dataset not found.")
     results = []

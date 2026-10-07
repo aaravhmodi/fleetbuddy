@@ -21,7 +21,7 @@
   },
   {
     "messages": [{"role": "user", "content": "How many faults did each robot have on June 15?"}],
-    "expected": "MR-03 had 4 faults; MR-05 had 3 faults"
+    "expected": "MR-03 4 faults; MR-05 3 faults"
   },
   {
     "messages": [{"role": "user", "content": "Compare MR-01 and MR-05 on litres applied per kilometre driven across the full dataset."}],
@@ -41,7 +41,7 @@
   },
   {
     "messages": [{"role": "user", "content": "What was the weather on June 15, and did it affect robot performance?"}],
-    "expected": "June 14, the CSV contains no weather data, ask for a location"
+    "expected": "June 15, CSV contains no weather data, location"
   },
   {
     "messages": [{"role": "user", "content": "What was the soil moisture on June 15?"}],
@@ -53,7 +53,7 @@
       {"role": "assistant", "content": "The dataset cannot answer because it contains no weather data."},
       {"role": "user", "content": "And the day before?"}
     ],
-    "expected": "I need a location to retrieve external weather from Open-Meteo; the CSV does not contain weather data"
+    "expected": "June 14, CSV contains no weather data, location"
   },
   {
     "messages": [
