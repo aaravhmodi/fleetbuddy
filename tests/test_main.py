@@ -177,8 +177,10 @@ class FakeResponsesClient:
     def __init__(self, responses: list[FakeResponse]) -> None:
         self.responses = self
         self._responses = iter(responses)
+        self.calls: list[dict[str, object]] = []
 
-    def create(self, **_: object) -> FakeResponse:
+    def create(self, **kwargs: object) -> FakeResponse:
+        self.calls.append(kwargs)
         return next(self._responses)
 
 
@@ -214,6 +216,19 @@ def test_separate_turns_have_separate_trace_ids_and_ordered_offsets(dataset: Dat
     assert first["trace_id"] != second["trace_id"]
     assert first["trace"]["steps"][0]["start_offset_ms"] >= 0
     assert second["trace"]["steps"][0]["start_offset_ms"] >= 0
+
+
+def test_follow_up_sends_full_conversation_history(dataset: Dataset, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeResponsesClient([FakeResponse([], "The dataset cannot answer that.")])
+    monkeypatch.setattr(main, "client", lambda: fake)
+    monkeypatch.setattr(main, "TRACES", [])
+    messages = [
+        main.Message(role="user", content="What was the weather on June 15?"),
+        main.Message(role="assistant", content="The dataset cannot answer because it contains no weather data."),
+        main.Message(role="user", content="And the day before?"),
+    ]
+    run_chat(dataset, messages)
+    assert fake.calls[0]["input"] == [message.model_dump() for message in messages]
 
 
 def test_analytics_empty() -> None:

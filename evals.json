@@ -49,6 +49,14 @@
   },
   {
     "messages": [
+      {"role": "user", "content": "What was the weather on June 15?"},
+      {"role": "assistant", "content": "The dataset cannot answer because it contains no weather data."},
+      {"role": "user", "content": "And the day before?"}
+    ],
+    "expected": "The dataset cannot answer because weather data is not included"
+  },
+  {
+    "messages": [
       {"role": "user", "content": "Which robot applied the most nitrogen on June 15?"},
       {"role": "assistant", "content": "MR-04 applied 210.49 L."},
       {"role": "user", "content": "How much did that same robot apply on June 14?"}
