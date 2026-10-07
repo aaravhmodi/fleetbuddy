@@ -1,0 +1,140 @@
+Fleet Buddy — Simple Implementation Plan
+
+Goal
+Keep the take-home small, readable, and easy to edit or explain live.
+
+Project structure
+
+takehome/
+├── main.py              # FastAPI app, tools, tracing, analytics
+├── static/index.html    # Entire dashboard UI
+├── robot_runs.csv
+├── evals.json
+├── tests/test_main.py
+├── requirements.txt
+└── README.md
+
+Phase 1: Data upload
+
+Implement POST /datasets.
+
+- Read the CSV with pandas.
+- Validate the seven required columns.
+- Store the DataFrame in an in-memory dictionary.
+- Return the dataset ID, columns/types, row count, time range, and robot IDs.
+- Reject invalid CSV shapes with clear errors.
+
+No database, service layer, repository layer, or unnecessary abstractions.
+
+Phase 2: Two simple tools
+
+Use only two function-calling tools:
+
+1. query_runs
+   - Filters by robot, date, state, and field.
+   - Returns raw rows.
+   - Maximum 50 rows.
+
+2. aggregate_runs
+   - Groups by robot, field, state, or date.
+   - Calculates sums, counts, averages, and min/max values.
+   - Handles totals and comparisons.
+
+The model receives the dataset profile, never the full CSV.
+
+Phase 3: Chat loop
+
+Implement POST /datasets/{id}/chat.
+
+- The client sends the complete conversation.
+- Call client.responses.create.
+- If the model requests a tool, parse its arguments and execute the tool.
+- Send the tool result back to the model.
+- Repeat until the model returns text.
+- Stop after eight model calls.
+- Return the reply and trace ID.
+
+Keep the loop in one readable function.
+
+Phase 4: Tracing
+
+Represent each trace as one plain dictionary:
+
+{
+    "id": "tr_...",
+    "question": "...",
+    "outcome": "answered",
+    "duration_ms": 123,
+    "input_tokens": 100,
+    "output_tokens": 50,
+    "cost": 0.0001,
+    "steps": [...]
+}
+
+Each step is either a model step or a tool step. Record arguments, results,
+timing, token counts, costs, and errors.
+
+Phase 5: Trace endpoints and analytics
+
+Add:
+
+- GET /traces
+- GET /traces/{id}
+- GET /analytics
+
+Analytics should calculate turn count, model/tool call counts, tool breakdown,
+input/output/total tokens, total cost, average and p95 latency, failed-turn
+share, and stopped-at-cap share.
+
+Phase 6: Evaluation
+
+Create ten straightforward cases in evals.json.
+
+Include known numeric answers, two unanswerable questions, and one follow-up
+that depends on earlier messages.
+
+Use a local scorer that checks expected robot IDs, numbers, and important words.
+Avoid model-based grading because it adds complexity and contaminates analytics.
+
+Add:
+
+- GET /evals
+- POST /datasets/{id}/evals
+
+Phase 7: Minimal dashboard
+
+Use one vanilla JavaScript file inside index.html.
+
+Required UI:
+
+- CSV upload
+- Dataset profile
+- Chat box
+- Trace table
+- Selected trace waterfall
+- Analytics numbers
+- Two small charts
+- Evaluation button and results
+
+Use plain HTML/CSS and either simple canvas charts or a CDN chart library.
+
+Phase 8: Tests and README
+
+Write API-key-free tests for CSV validation, profile generation, aggregation,
+the 50-row cap, scoring, and tool error handling.
+
+README should explain how to run the project, tool design, trace design,
+scoring approach, trade-offs, and next steps.
+
+Recommended build order
+
+1. Upload and validation
+2. Tools
+3. Chat loop
+4. Traces
+5. Analytics
+6. Dashboard
+7. Evaluations
+8. Tests and README
+
+Keep most of the code in main.py so it remains easy to edit and explain live.

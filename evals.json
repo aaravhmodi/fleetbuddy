@@ -1,0 +1,58 @@
+[
+  {
+    "messages": [{"role": "user", "content": "Which robot applied the most nitrogen on June 15, and how much?"}],
+    "expected": "MR-04, 210.49 L"
+  },
+  {
+    "messages": [{"role": "user", "content": "What was the total nitrogen applied by the whole fleet on June 15?"}],
+    "expected": "1012.00 L"
+  },
+  {
+    "messages": [{"role": "user", "content": "Which robot had the lowest average battery percentage on June 15?"}],
+    "expected": "MR-02, 57.13% average battery"
+  },
+  {
+    "messages": [{"role": "user", "content": "How was MR-01 utilized across the full dataset? Give the interval counts by state."}],
+    "expected": "MR-01 applying 538, charging 139, idle 97, driving 90 intervals"
+  },
+  {
+    "messages": [{"role": "user", "content": "Which robot spent the most time charging on June 15? Convert the five-minute intervals to hours and minutes."}],
+    "expected": "MR-01, 69 intervals, 345 minutes, 5 hours 45 minutes"
+  },
+  {
+    "messages": [{"role": "user", "content": "How many faults did each robot have on June 15?"}],
+    "expected": "MR-03 had 4 faults and MR-05 had 3 faults; the other robots had 0"
+  },
+  {
+    "messages": [{"role": "user", "content": "Compare MR-01 and MR-05 on litres applied per kilometre driven across the full dataset."}],
+    "expected": "MR-01 7.50 L/km; MR-05 8.37 L/km"
+  },
+  {
+    "messages": [{"role": "user", "content": "Which field produced the most nitrogen on June 15?"}],
+    "expected": "Creekside, 351.13 L"
+  },
+  {
+    "messages": [{"role": "user", "content": "Show the fleet's total nitrogen trend for June 14, June 15, and June 16."}],
+    "expected": "June 14 1037.33 L, June 15 1012.00 L, June 16 1022.84 L"
+  },
+  {
+    "messages": [{"role": "user", "content": "Which robot drove the greatest total distance across all three days?"}],
+    "expected": "MR-01, 64815 m"
+  },
+  {
+    "messages": [{"role": "user", "content": "What was the weather on June 15, and did it affect robot performance?"}],
+    "expected": "The dataset cannot answer because it contains no weather data"
+  },
+  {
+    "messages": [{"role": "user", "content": "What was the soil moisture on June 15?"}],
+    "expected": "The dataset cannot answer because soil moisture is not included"
+  },
+  {
+    "messages": [
+      {"role": "user", "content": "Which robot applied the most nitrogen on June 15?"},
+      {"role": "assistant", "content": "MR-04 applied 210.49 L."},
+      {"role": "user", "content": "How much did that same robot apply on June 14?"}
+    ],
+    "expected": "MR-04, 192.79 L on June 14"
+  }
+]
