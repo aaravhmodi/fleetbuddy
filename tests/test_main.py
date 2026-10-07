@@ -5,7 +5,7 @@ import pandas as pd
 import pytest
 
 import main
-from main import Dataset, analytics, build_evidence, build_visualization, normalize_latex_response, parse_dataset, run_aggregate_runs, run_chat, run_query_runs, score_reply
+from main import Dataset, analytics, build_evidence, build_visualization, normalize_latex_response, parse_dataset, run_aggregate_runs, run_chat, run_get_weather, run_query_runs, score_reply
 
 
 CSV = Path(__file__).parents[1] / "robot_runs.csv"
@@ -81,6 +81,49 @@ MR-01: ( \frac{173.05}{16901} \approx 0.01024 ) L/m""")
     assert "$$" in reply
     assert r"\(" in reply and r"\)" in reply
     assert "\n[" not in reply and "\n]" not in reply
+
+
+def test_weather_requires_a_location(dataset: Dataset) -> None:
+    with pytest.raises(ValueError, match="location is required"):
+        run_get_weather(dataset, {"date": "2026-06-15"})
+
+
+def test_weather_uses_geocoding_and_archive(monkeypatch: pytest.MonkeyPatch, dataset: Dataset) -> None:
+    class FakeHTTPResponse:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self.payload = payload
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return self.payload
+
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    def fake_get(url: str, *, params: dict[str, object], timeout: float) -> FakeHTTPResponse:
+        calls.append((url, params))
+        if "geocoding" in url:
+            return FakeHTTPResponse({"results": [{"name": "Toronto", "admin1": "Ontario", "country": "Canada", "latitude": 43.65, "longitude": -79.38}]})
+        return FakeHTTPResponse({
+            "daily": {
+                "time": ["2026-06-15"],
+                "weather_code": [3],
+                "temperature_2m_mean": [20.1],
+                "temperature_2m_max": [25.0],
+                "temperature_2m_min": [15.2],
+                "precipitation_sum": [1.4],
+                "rain_sum": [1.4],
+                "wind_speed_10m_max": [24.0],
+            }
+        })
+
+    monkeypatch.setattr(main.httpx, "get", fake_get)
+    main.WEATHER_CACHE.clear()
+    result = run_get_weather(dataset, {"location": "Toronto, Canada", "date": "2026-06-15"})
+    assert result["source"] == "Open-Meteo historical weather API"
+    assert result["rows"][0]["temperature_mean_c"] == 20.1
+    assert len(calls) == 2
 
 
 def test_all_is_a_no_filter_value(dataset: Dataset) -> None:

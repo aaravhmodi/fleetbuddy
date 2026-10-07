@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import pandas as pd
+import httpx
 from fastapi import FastAPI, File, HTTPException, Response, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -36,6 +37,8 @@ MAX_MODEL_CALLS = 8
 MAX_TOOL_ROWS = 50
 MAX_QUERY_WINDOW_DAYS = 90
 MAX_FILTER_STRING_LENGTH = 64
+OPEN_METEO_GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
+OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 
 
 class Message(BaseModel):
@@ -61,6 +64,7 @@ class Dataset:
 
 DATASETS: dict[str, Dataset] = {}
 TRACES: list[dict[str, Any]] = []
+WEATHER_CACHE: dict[str, dict[str, Any]] = {}
 
 
 app = FastAPI(title="Fleet Buddy", version="1.0.0")
@@ -325,6 +329,104 @@ def run_aggregate_runs(dataset: Dataset, args: dict[str, Any]) -> dict[str, Any]
     return result
 
 
+def run_get_weather(dataset: Dataset, args: dict[str, Any]) -> dict[str, Any]:
+    location = str(args.get("location") or "").strip()
+    latitude = args.get("latitude")
+    longitude = args.get("longitude")
+    if len(location) > MAX_FILTER_STRING_LENGTH:
+        raise ValueError(f"location exceeds maximum length of {MAX_FILTER_STRING_LENGTH}.")
+    if location and (latitude is not None or longitude is not None):
+        raise ValueError("Use location or latitude/longitude, not both.")
+    if not location and (latitude is None or longitude is None):
+        raise ValueError("A weather location is required. Provide location or both latitude and longitude.")
+    if latitude is not None or longitude is not None:
+        try:
+            latitude = float(latitude)
+            longitude = float(longitude)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("latitude and longitude must be numeric.") from exc
+        if not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
+            raise ValueError("latitude must be between -90 and 90 and longitude between -180 and 180.")
+
+    validate_tool_window(args)
+    date_value = args.get("date")
+    if date_value:
+        start_date = end_date = parse_date(str(date_value)).strftime("%Y-%m-%d")
+    else:
+        start = parse_date(args.get("start_date"))
+        end = parse_date(args.get("end_date"))
+        start_date = (start or parse_date(dataset.profile["time_range"]["start"])).strftime("%Y-%m-%d")
+        end_date = (end or start or parse_date(dataset.profile["time_range"]["end"])).strftime("%Y-%m-%d")
+    if end_date < start_date:
+        raise ValueError("end_date must be after start_date.")
+
+    if location:
+        cache_key = json.dumps({"location": location.lower()}, sort_keys=True)
+        geocoded = WEATHER_CACHE.get(cache_key)
+        if geocoded is None:
+            response = httpx.get(OPEN_METEO_GEOCODING_URL, params={"name": location, "count": 1, "language": "en", "format": "json"}, timeout=10.0)
+            response.raise_for_status()
+            payload = response.json()
+            results = payload.get("results") or []
+            if not results:
+                raise ValueError(f"Open-Meteo could not find a location matching '{location}'.")
+            match = results[0]
+            geocoded = {
+                "name": match.get("name") or location,
+                "admin1": match.get("admin1"),
+                "country": match.get("country"),
+                "latitude": float(match["latitude"]),
+                "longitude": float(match["longitude"]),
+            }
+            WEATHER_CACHE[cache_key] = geocoded
+        latitude = geocoded["latitude"]
+        longitude = geocoded["longitude"]
+        resolved_location = ", ".join(part for part in [geocoded.get("name"), geocoded.get("admin1"), geocoded.get("country")] if part)
+    else:
+        resolved_location = f"{latitude:.4f}, {longitude:.4f}"
+
+    params = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "start_date": start_date,
+        "end_date": end_date,
+        "daily": "weather_code,temperature_2m_mean,temperature_2m_max,temperature_2m_min,precipitation_sum,rain_sum,wind_speed_10m_max",
+        "timezone": "auto",
+        "temperature_unit": "celsius",
+        "wind_speed_unit": "kmh",
+        "precipitation_unit": "mm",
+    }
+    response = httpx.get(OPEN_METEO_ARCHIVE_URL, params=params, timeout=10.0)
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("error"):
+        raise ValueError(payload.get("reason") or "Open-Meteo returned a weather error.")
+    daily = payload.get("daily") or {}
+    times = daily.get("time") or []
+    rows = []
+    for index, date in enumerate(times):
+        rows.append({
+            "date": date,
+            "weather_code": (daily.get("weather_code") or [None] * len(times))[index],
+            "temperature_mean_c": (daily.get("temperature_2m_mean") or [None] * len(times))[index],
+            "temperature_max_c": (daily.get("temperature_2m_max") or [None] * len(times))[index],
+            "temperature_min_c": (daily.get("temperature_2m_min") or [None] * len(times))[index],
+            "precipitation_mm": (daily.get("precipitation_sum") or [None] * len(times))[index],
+            "rain_mm": (daily.get("rain_sum") or [None] * len(times))[index],
+            "wind_max_kmh": (daily.get("wind_speed_10m_max") or [None] * len(times))[index],
+        })
+    return {
+        "source": "Open-Meteo historical weather API",
+        "location": resolved_location,
+        "latitude": latitude,
+        "longitude": longitude,
+        "effective_time_range": {"start": f"{start_date}T00:00:00", "end": f"{end_date}T23:59:59"},
+        "rows": rows,
+        "units": {"temperature": "°C", "precipitation": "mm", "wind": "km/h"},
+        "note": "Historical weather is external reanalysis data, not a measurement stored in the uploaded CSV.",
+    }
+
+
 TOOLS = [
     {
         "type": "function",
@@ -363,12 +465,29 @@ TOOLS = [
             "additionalProperties": False,
         },
     },
+    {
+        "type": "function",
+        "name": "get_weather",
+        "description": "Retrieve daily historical weather from Open-Meteo for a supplied city/location or latitude and longitude. The CSV has no coordinates, so never infer a farm location from field names. Use this only when the user supplies a location or coordinates; otherwise ask for the location. Weather is external data and must be labeled as such.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "location": {"type": "string", "description": "City, region, or postal code, such as Toronto, Canada."},
+                "latitude": {"type": "number", "minimum": -90, "maximum": 90},
+                "longitude": {"type": "number", "minimum": -180, "maximum": 180},
+                "date": {"type": "string", "description": "UTC calendar date YYYY-MM-DD"},
+                "start_date": {"type": "string"},
+                "end_date": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+    },
 ]
 
 
 SYSTEM_PROMPT_TEMPLATE = """You are Fleet Buddy, an accurate analyst for a robot-run CSV.
 Answer only from tool results. The dataset profile below describes available columns and scope; it deliberately contains no rows.
-If the question asks for information outside the profile/data (for example weather), say clearly that the dataset cannot answer it. Do not invent facts.
+If the question asks for information outside the CSV, do not invent facts. For weather, use get_weather only when the user supplies a city/location or coordinates; if no location is supplied, clearly ask for it. Label Open-Meteo results as external historical weather and never imply the CSV contained weather.
 Use aggregate_runs for totals, comparisons, rates, and counts; use query_runs for exact events and timestamps. For litres per kilometre, request the server-side efficiency_l_per_km metric and include sum_nitrogen and sum_distance when the numerator and denominator help explain the result. Never divide by zero or treat a null denominator as zero. `row_count` means five-minute source intervals, not distinct robots or events; use `robot_count` for distinct robots observed in a group and do not present it as simultaneous headcount. State assumptions and units, and round sensibly.
 The CSV column named field means farm field/location. Never put a metric name such as nitrogen_applied_l in field; metric names belong only in metrics.
 Format answers with Markdown: use **bold** for key results, headings with `##`, and bullet lists when useful. For equations, use `\\( ... \\)` for inline math and `$$ ... $$` for display math. For example, write `MR-01: \\(\\frac{{173.05}}{{16901}} \\approx 0.01024\\) L/m`, never `( \\frac{{...}} )` without delimiters. Never use bare `[` and `]` lines to delimit an equation. Do not wrap ordinary text in math delimiters.
@@ -412,6 +531,8 @@ def call_tool(dataset: Dataset, name: str, args: dict[str, Any]) -> dict[str, An
         return run_query_runs(dataset, args)
     if name == "aggregate_runs":
         return run_aggregate_runs(dataset, args)
+    if name == "get_weather":
+        return run_get_weather(dataset, args)
     raise ValueError(f"Unknown tool: {name}")
 
 
@@ -432,6 +553,7 @@ def build_visualization(trace: dict[str, Any]) -> dict[str, Any] | None:
     """Turn the structured tool result into a small, honest chart for the UI."""
     aggregate_groups: dict[tuple[str, tuple[str, ...], str], dict[str, Any]] = {}
     query_candidates: list[tuple[int, dict[str, Any], list[dict[str, Any]]]] = []
+    weather_candidates: list[tuple[int, dict[str, Any], list[dict[str, Any]]]] = []
     for step_index, step in enumerate(trace.get("steps", [])):
         if step.get("type") != "tool" or step.get("error"):
             continue
@@ -454,6 +576,8 @@ def build_visualization(trace: dict[str, Any]) -> dict[str, Any] | None:
                 group["rows"][row_key] = row
         if step.get("name") == "query_runs":
             query_candidates.append((step_index, step, rows))
+        if step.get("name") == "get_weather":
+            weather_candidates.append((step_index, step, rows))
     if aggregate_groups:
         group = max(aggregate_groups.values(), key=lambda item: (len(item["rows"]), item["step_index"]))
         step = group["step"]
@@ -485,6 +609,18 @@ def build_visualization(trace: dict[str, Any]) -> dict[str, Any] | None:
                 "datasets": [{"label": "Intervals", "data": list(counts.values())}],
                 "source_step_id": step.get("id"),
             }
+    if weather_candidates:
+        _, step, rows = weather_candidates[-1]
+        metric = "temperature_mean_c" if any(row.get("temperature_mean_c") is not None for row in rows) else "precipitation_mm"
+        labels = [str(row.get("date")) for row in rows]
+        values = [float(row.get(metric) or 0) for row in rows]
+        return {
+            "type": "bar",
+            "title": "External weather: " + ("Mean temperature (°C)" if metric == "temperature_mean_c" else "Precipitation (mm)"),
+            "labels": labels,
+            "datasets": [{"label": metric, "data": values}],
+            "source_step_id": step.get("id"),
+        }
     return None
 
 
@@ -494,6 +630,7 @@ def build_evidence(trace: dict[str, Any]) -> dict[str, Any] | None:
         return None
     ranges = []
     filters = []
+    sources = []
     result_rows = 0
     truncated = False
     for step in tool_steps:
@@ -502,6 +639,8 @@ def build_evidence(trace: dict[str, Any]) -> dict[str, Any] | None:
             ranges.append(result["effective_time_range"])
         if result.get("filters"):
             filters.append(result["filters"])
+        if result.get("source") and result["source"] not in sources:
+            sources.append(result["source"])
         result_rows += len(result.get("rows") or [])
         truncated = truncated or bool(result.get("truncated"))
     return {
@@ -509,6 +648,7 @@ def build_evidence(trace: dict[str, Any]) -> dict[str, Any] | None:
         "step_ids": [step["id"] for step in tool_steps],
         "effective_time_ranges": ranges,
         "filters": filters,
+        "sources": sources,
         "result_rows": result_rows,
         "truncated": truncated,
     }

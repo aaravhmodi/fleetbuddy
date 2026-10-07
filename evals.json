@@ -41,7 +41,7 @@
   },
   {
     "messages": [{"role": "user", "content": "What was the weather on June 15, and did it affect robot performance?"}],
-    "expected": "The dataset cannot answer because it contains no weather data"
+    "expected": "I need a location to retrieve external weather from Open-Meteo; the CSV does not contain weather data"
   },
   {
     "messages": [{"role": "user", "content": "What was the soil moisture on June 15?"}],
@@ -53,7 +53,7 @@
       {"role": "assistant", "content": "The dataset cannot answer because it contains no weather data."},
       {"role": "user", "content": "And the day before?"}
     ],
-    "expected": "The dataset cannot answer because weather data is not included"
+    "expected": "I need a location to retrieve external weather from Open-Meteo; the CSV does not contain weather data"
   },
   {
     "messages": [
