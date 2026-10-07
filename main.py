@@ -442,6 +442,32 @@ def build_visualization(trace: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def build_evidence(trace: dict[str, Any]) -> dict[str, Any] | None:
+    tool_steps = [step for step in trace.get("steps", []) if step.get("type") == "tool" and not step.get("error")]
+    if not tool_steps:
+        return None
+    ranges = []
+    filters = []
+    result_rows = 0
+    truncated = False
+    for step in tool_steps:
+        result = step.get("result") or {}
+        if result.get("effective_time_range") and result["effective_time_range"] not in ranges:
+            ranges.append(result["effective_time_range"])
+        if result.get("filters"):
+            filters.append(result["filters"])
+        result_rows += len(result.get("rows") or [])
+        truncated = truncated or bool(result.get("truncated"))
+    return {
+        "tools": list(dict.fromkeys(step["name"] for step in tool_steps)),
+        "step_ids": [step["id"] for step in tool_steps],
+        "effective_time_ranges": ranges,
+        "filters": filters,
+        "result_rows": result_rows,
+        "truncated": truncated,
+    }
+
+
 def run_chat(dataset: Dataset, messages: list[Message]) -> dict[str, Any]:
     trace = {
         "id": f"tr_{uuid.uuid4().hex[:12]}",
@@ -457,6 +483,7 @@ def run_chat(dataset: Dataset, messages: list[Message]) -> dict[str, Any]:
         "cost": 0.0,
         "duration_ms": 0.0,
         "visualization": None,
+        "evidence": None,
     }
     started = time.perf_counter()
     prompt = SYSTEM_PROMPT_TEMPLATE.format(profile=json.dumps(dataset.profile, indent=2))
@@ -537,10 +564,11 @@ def run_chat(dataset: Dataset, messages: list[Message]) -> dict[str, Any]:
         trace["error"] = str(exc)
         trace["reply"] = "I couldn't complete that turn. Please check the server configuration and try again."
     trace["visualization"] = build_visualization(trace)
+    trace["evidence"] = build_evidence(trace)
     trace["duration_ms"] = round((time.perf_counter() - started) * 1000, 2)
     trace["cost"] = round(trace["cost"], 8)
     TRACES.append(trace)
-    return {"reply": trace["reply"], "trace_id": trace["id"], "visualization": trace["visualization"], "trace": trace}
+    return {"reply": trace["reply"], "trace_id": trace["id"], "visualization": trace["visualization"], "evidence": trace["evidence"], "trace": trace}
 
 
 def normalize_text(value: str) -> str:
@@ -645,7 +673,7 @@ def chat(dataset_id: str, request: ChatRequest, response: Response) -> dict[str,
         raise HTTPException(status_code=404, detail="Dataset not found.")
     result = run_chat(dataset, request.messages)
     response.headers["X-Trace-ID"] = result["trace_id"]
-    return {"reply": result["reply"], "trace_id": result["trace_id"], "visualization": result["visualization"]}
+    return {"reply": result["reply"], "trace_id": result["trace_id"], "visualization": result["visualization"], "evidence": result["evidence"]}
 
 
 @app.get("/traces")
@@ -688,6 +716,7 @@ def run_evals(dataset_id: str, cases: list[EvalCase]) -> dict[str, Any]:
             "expected": case.expected,
             "reply": run["reply"],
             "visualization": run["visualization"],
+            "evidence": run["evidence"],
             "trace_id": run["trace_id"],
         })
     passed_count = sum(result["passed"] for result in results)

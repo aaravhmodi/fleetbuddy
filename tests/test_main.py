@@ -4,7 +4,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from main import Dataset, analytics, build_visualization, parse_dataset, run_aggregate_runs, run_query_runs, score_reply
+from main import Dataset, analytics, build_evidence, build_visualization, parse_dataset, run_aggregate_runs, run_query_runs, score_reply
 
 
 CSV = Path(__file__).parents[1] / "robot_runs.csv"
@@ -78,6 +78,25 @@ def test_aggregate_result_creates_visualization() -> None:
     assert chart is not None
     assert chart["labels"] == ["MR-01", "MR-04"]
     assert chart["datasets"][0]["data"] == [100.0, 210.49]
+
+
+def test_evidence_summarizes_tool_provenance() -> None:
+    evidence = build_evidence({
+        "steps": [{
+            "id": "step_2",
+            "type": "tool",
+            "name": "aggregate_runs",
+            "result": {
+                "effective_time_range": {"start": "2026-06-15T00:00:00Z", "end": "2026-06-15T23:55:00Z"},
+                "filters": {"date": "2026-06-15"},
+                "rows": [{"robot_id": "MR-04", "sum_nitrogen": 210.49}],
+                "truncated": False,
+            },
+        }]
+    })
+    assert evidence["tools"] == ["aggregate_runs"]
+    assert evidence["result_rows"] == 1
+    assert evidence["effective_time_ranges"][0]["start"].startswith("2026-06-15")
 
 
 def test_analytics_empty() -> None:
