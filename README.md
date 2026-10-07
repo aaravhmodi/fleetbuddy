@@ -32,11 +32,11 @@ The model receives the profile in `instructions`, never the raw rows. It has thr
 
 - `query_runs` filters rows for exact events and timestamps, with a hard maximum of 50 returned rows.
 - `aggregate_runs` calculates grouped sums, averages, extrema, and row counts for totals and comparisons.
-- `get_weather` optionally geocodes a user-supplied location and retrieves daily historical weather from Open-Meteo. It never infers coordinates from ambiguous CSV field names; without a location it asks the user for one.
+- `get_weather` optionally geocodes a user-supplied location and retrieves historical weather or soil-moisture reanalysis from Open-Meteo. It never infers coordinates from ambiguous CSV field names; without a location it asks the user for one.
 
 The five-minute sampling interval is explicitly described to the model so a charging row count can be converted to minutes. Keeping aggregation on the server prevents the full CSV from entering the prompt and makes answers reproducible.
 
-Weather is deliberately marked as external evidence. The uploaded CSV remains the source of truth for robot metrics, while Open-Meteo historical weather is used only when the user supplies a location or coordinates. Weather evidence includes the resolved location, date range, units, and source in the trace.
+Environmental data is deliberately marked as external evidence. The uploaded CSV remains the source of truth for robot metrics, while Open-Meteo historical weather and soil-moisture reanalysis are used only when the user supplies a location or coordinates. Evidence includes the resolved location, date range, units, and source in the trace; soil moisture is described as modeled reanalysis rather than an on-farm sensor reading.
 
 Each chat turn gets a unique trace ID. A trace contains the complete conversation, prompt version, model configuration, ordered model/tool steps, response IDs, arguments, returned results, errors, durations, usage, hard-coded cost, final reply, and outcome. It also records traced-step time, orchestration time outside those steps, and timing coverage so the waterfall can explain the entire turn. Model pricing is intentionally explicit (`$0.15 / 1M` input tokens and `$0.60 / 1M` output tokens) so the analytics are deterministic and easy to replace. Tool errors are returned as structured function output, allowing the model to recover; eight model calls is the turn cap.
 

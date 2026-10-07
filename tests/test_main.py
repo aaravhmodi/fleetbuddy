@@ -146,8 +146,58 @@ def test_weather_uses_geocoding_and_archive(monkeypatch: pytest.MonkeyPatch, dat
     main.WEATHER_CACHE.clear()
     result = run_get_weather(dataset, {"location": "Example City", "date": "2026-06-15"})
     assert result["source"] == "Open-Meteo historical weather API"
+    assert result["data_type"] == "weather"
     assert result["rows"][0]["temperature_mean_c"] == 20.1
     assert len(calls) == 2
+
+
+def test_soil_moisture_uses_open_meteo_hourly_data(monkeypatch: pytest.MonkeyPatch, dataset: Dataset) -> None:
+    class FakeHTTPResponse:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self.payload = payload
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return self.payload
+
+    archive_params: dict[str, object] = {}
+
+    def fake_get(url: str, *, params: dict[str, object], timeout: float) -> FakeHTTPResponse:
+        if "geocoding" in url:
+            return FakeHTTPResponse({"results": [{"name": "Guelph", "admin1": "Ontario", "country": "Canada", "latitude": 43.54, "longitude": -80.25}]})
+        archive_params.update(params)
+        return FakeHTTPResponse({
+            "hourly": {
+                "time": ["2026-06-15T00:00", "2026-06-15T01:00"],
+                "soil_moisture_0_to_7cm": [0.2, 0.3],
+                "soil_moisture_7_to_28cm": [0.3, 0.4],
+                "soil_moisture_28_to_100cm": [0.4, 0.5],
+                "soil_moisture_100_to_255cm": [0.5, 0.6],
+            }
+        })
+
+    monkeypatch.setattr(main.httpx, "get", fake_get)
+    main.WEATHER_CACHE.clear()
+    result = run_get_weather(dataset, {
+        "location": "Guelph",
+        "latitude": 0,
+        "longitude": 0,
+        "date": "2026-06-15",
+        "data_type": "soil_moisture",
+    })
+    assert "soil_moisture_0_to_7cm" in str(archive_params["hourly"])
+    assert result["data_type"] == "soil_moisture"
+    assert result["units"] == {"soil_moisture": "m³/m³"}
+    assert result["rows"] == [{
+        "date": "2026-06-15",
+        "soil_moisture_0_to_7cm_m3_m3": 0.25,
+        "soil_moisture_7_to_28cm_m3_m3": 0.35,
+        "soil_moisture_28_to_100cm_m3_m3": 0.45,
+        "soil_moisture_100_to_255cm_m3_m3": 0.55,
+    }]
+    assert "reanalysis" in result["note"]
 
 
 def test_all_is_a_no_filter_value(dataset: Dataset) -> None:
@@ -340,6 +390,20 @@ def test_weather_follow_up_records_limitation_grounding(dataset: Dataset, monkey
         "status": "limitation",
         "successful_tool_steps": [],
     }
+
+
+def test_soil_moisture_limitation_adds_location_follow_up(dataset: Dataset, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeResponsesClient([
+        FakeResponse([], "The CSV doesn't contain soil-moisture measurements for June 15."),
+    ])
+    monkeypatch.setattr(main, "client", lambda: fake)
+    monkeypatch.setattr(main, "TRACES", [])
+    result = run_chat(dataset, [main.Message(role="user", content="What was the soil moisture on June 15?")])
+    assert "Open-Meteo" in result["reply"]
+    assert "What city, region, or coordinates" in result["reply"]
+    assert result["trace"]["grounding"]["status"] == "limitation"
+    passed, _ = score_reply(result["reply"], "June 15, soil moisture isn't available in the CSV, Open-Meteo, location")
+    assert passed
 
 
 def test_turn_stops_at_eight_model_calls(dataset: Dataset, monkeypatch: pytest.MonkeyPatch) -> None:

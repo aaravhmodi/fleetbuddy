@@ -45,7 +45,7 @@
   },
   {
     "messages": [{"role": "user", "content": "What was the soil moisture on June 15?"}],
-    "expected": "Soil moisture isn't available in the CSV"
+    "expected": "June 15, soil moisture isn't available in the CSV, Open-Meteo, location"
   },
   {
     "messages": [

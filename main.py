@@ -38,7 +38,7 @@ MAX_MODEL_CALLS = 8
 MAX_TOOL_ROWS = 50
 MAX_QUERY_WINDOW_DAYS = 90
 MAX_FILTER_STRING_LENGTH = 64
-PROMPT_VERSION = "fleet-buddy-2026-10-07.2"
+PROMPT_VERSION = "fleet-buddy-2026-10-07.3"
 OPEN_METEO_GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
 OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 
@@ -335,13 +335,18 @@ def run_aggregate_runs(dataset: Dataset, args: dict[str, Any]) -> dict[str, Any]
 
 def run_get_weather(dataset: Dataset, args: dict[str, Any]) -> dict[str, Any]:
     location = str(args.get("location") or "").strip()
+    data_type = str(args.get("data_type") or "weather").strip().lower()
+    if data_type not in {"weather", "soil_moisture"}:
+        raise ValueError("data_type must be weather or soil_moisture.")
     latitude = args.get("latitude")
     longitude = args.get("longitude")
     if len(location) > MAX_FILTER_STRING_LENGTH:
         raise ValueError(f"location exceeds maximum length of {MAX_FILTER_STRING_LENGTH}.")
-    if location and (latitude is not None or longitude is not None):
-        raise ValueError("Use location or latitude/longitude, not both.")
-    if not location and (latitude is None or longitude is None):
+    if location:
+        # Treat the user's location text as authoritative. Models sometimes add inferred
+        # coordinates as well; geocoding the supplied text avoids trusting that guess.
+        latitude = longitude = None
+    elif latitude is None or longitude is None:
         raise ValueError("A weather location is required. Provide location or both latitude and longitude.")
     if latitude is not None or longitude is not None:
         try:
@@ -391,45 +396,76 @@ def run_get_weather(dataset: Dataset, args: dict[str, Any]) -> dict[str, Any]:
     else:
         resolved_location = f"{latitude:.4f}, {longitude:.4f}"
 
-    params = {
+    params: dict[str, Any] = {
         "latitude": latitude,
         "longitude": longitude,
         "start_date": start_date,
         "end_date": end_date,
-        "daily": "weather_code,temperature_2m_mean,temperature_2m_max,temperature_2m_min,precipitation_sum,rain_sum,wind_speed_10m_max",
         "timezone": "auto",
         "temperature_unit": "celsius",
         "wind_speed_unit": "kmh",
         "precipitation_unit": "mm",
     }
+    if data_type == "soil_moisture":
+        params["hourly"] = "soil_moisture_0_to_7cm,soil_moisture_7_to_28cm,soil_moisture_28_to_100cm,soil_moisture_100_to_255cm"
+    else:
+        params["daily"] = "weather_code,temperature_2m_mean,temperature_2m_max,temperature_2m_min,precipitation_sum,rain_sum,wind_speed_10m_max"
     response = httpx.get(OPEN_METEO_ARCHIVE_URL, params=params, timeout=10.0)
     response.raise_for_status()
     payload = response.json()
     if payload.get("error"):
         raise ValueError(payload.get("reason") or "Open-Meteo returned a weather error.")
-    daily = payload.get("daily") or {}
-    times = daily.get("time") or []
     rows = []
-    for index, date in enumerate(times):
-        rows.append({
-            "date": date,
-            "weather_code": (daily.get("weather_code") or [None] * len(times))[index],
-            "temperature_mean_c": (daily.get("temperature_2m_mean") or [None] * len(times))[index],
-            "temperature_max_c": (daily.get("temperature_2m_max") or [None] * len(times))[index],
-            "temperature_min_c": (daily.get("temperature_2m_min") or [None] * len(times))[index],
-            "precipitation_mm": (daily.get("precipitation_sum") or [None] * len(times))[index],
-            "rain_mm": (daily.get("rain_sum") or [None] * len(times))[index],
-            "wind_max_kmh": (daily.get("wind_speed_10m_max") or [None] * len(times))[index],
-        })
+    if data_type == "soil_moisture":
+        hourly = payload.get("hourly") or {}
+        times = hourly.get("time") or []
+        variables = {
+            "soil_moisture_0_to_7cm": "soil_moisture_0_to_7cm_m3_m3",
+            "soil_moisture_7_to_28cm": "soil_moisture_7_to_28cm_m3_m3",
+            "soil_moisture_28_to_100cm": "soil_moisture_28_to_100cm_m3_m3",
+            "soil_moisture_100_to_255cm": "soil_moisture_100_to_255cm_m3_m3",
+        }
+        grouped: dict[str, dict[str, list[float]]] = {}
+        for index, timestamp in enumerate(times):
+            date = str(timestamp)[:10]
+            day = grouped.setdefault(date, {output: [] for output in variables.values()})
+            for source, output in variables.items():
+                values = hourly.get(source) or []
+                value = values[index] if index < len(values) else None
+                if isinstance(value, (int, float)):
+                    day[output].append(float(value))
+        for date, values_by_depth in grouped.items():
+            rows.append({
+                "date": date,
+                **{
+                    key: round(sum(values) / len(values), 4) if values else None
+                    for key, values in values_by_depth.items()
+                },
+            })
+    else:
+        daily = payload.get("daily") or {}
+        times = daily.get("time") or []
+        for index, date in enumerate(times):
+            rows.append({
+                "date": date,
+                "weather_code": (daily.get("weather_code") or [None] * len(times))[index],
+                "temperature_mean_c": (daily.get("temperature_2m_mean") or [None] * len(times))[index],
+                "temperature_max_c": (daily.get("temperature_2m_max") or [None] * len(times))[index],
+                "temperature_min_c": (daily.get("temperature_2m_min") or [None] * len(times))[index],
+                "precipitation_mm": (daily.get("precipitation_sum") or [None] * len(times))[index],
+                "rain_mm": (daily.get("rain_sum") or [None] * len(times))[index],
+                "wind_max_kmh": (daily.get("wind_speed_10m_max") or [None] * len(times))[index],
+            })
     return {
         "source": "Open-Meteo historical weather API",
+        "data_type": data_type,
         "location": resolved_location,
         "latitude": latitude,
         "longitude": longitude,
         "effective_time_range": {"start": f"{start_date}T00:00:00", "end": f"{end_date}T23:59:59"},
         "rows": rows,
-        "units": {"temperature": "°C", "precipitation": "mm", "wind": "km/h"},
-        "note": "Historical weather is external reanalysis data, not a measurement stored in the uploaded CSV.",
+        "units": ({"soil_moisture": "m³/m³"} if data_type == "soil_moisture" else {"temperature": "°C", "precipitation": "mm", "wind": "km/h"}),
+        "note": ("Historical soil moisture is external reanalysis data, not an on-farm sensor measurement or a value stored in the uploaded CSV." if data_type == "soil_moisture" else "Historical weather is external reanalysis data, not a measurement stored in the uploaded CSV."),
     }
 
 
@@ -474,13 +510,14 @@ TOOLS = [
     {
         "type": "function",
         "name": "get_weather",
-        "description": "Retrieve daily historical weather from Open-Meteo for a supplied city/location or latitude and longitude. The CSV has no coordinates, so never infer a farm location from field names. Use this only when the user supplies a location or coordinates; otherwise ask for the location. Weather is external data and must be labeled as such.",
+        "description": "Retrieve historical weather or soil-moisture reanalysis from Open-Meteo for a supplied city/location or latitude and longitude. The CSV has no coordinates, so never infer a farm location from field names. If the user asks for soil moisture, set data_type to soil_moisture. Use this only when the user supplies a location or coordinates; otherwise ask for the location. Results are external data and must be labeled as such.",
         "parameters": {
             "type": "object",
             "properties": {
                 "location": {"type": "string", "description": "City, region, or postal code supplied by the user."},
                 "latitude": {"type": "number", "minimum": -90, "maximum": 90},
                 "longitude": {"type": "number", "minimum": -180, "maximum": 180},
+                "data_type": {"type": "string", "enum": ["weather", "soil_moisture"]},
                 "date": {"type": "string", "description": "UTC calendar date YYYY-MM-DD"},
                 "start_date": {"type": "string"},
                 "end_date": {"type": "string"},
@@ -493,12 +530,12 @@ TOOLS = [
 
 SYSTEM_PROMPT_TEMPLATE = """You are Fleet Buddy, an accurate analyst for a robot-run CSV.
 Answer only from tool results. The dataset profile below describes available columns and scope; it deliberately contains no rows.
-If the question asks for information outside the CSV, do not invent facts. For weather, use get_weather only when the user supplies a city/location or coordinates; if no location is supplied, clearly ask for it. Label Open-Meteo results as external historical weather and never imply the CSV contained weather.
+If the question asks for information outside the CSV, do not invent facts. Weather and soil moisture can be retrieved from Open-Meteo only when the user supplies a city/location or coordinates; if no location is supplied, clearly ask for it and offer the external lookup. For soil moisture, call get_weather with data_type=soil_moisture and explain that the result is reanalysis rather than an on-farm sensor measurement. Label Open-Meteo results as external historical data and never imply the CSV contained them.
 Use aggregate_runs for totals, comparisons, rates, and counts; use query_runs for exact events and timestamps. For litres applied per kilometre, request the server-side efficiency_l_per_km metric and follow the user's stated scope; do not add a state filter unless the user explicitly names a state. Include sum_nitrogen and sum_distance when the numerator and denominator help explain the result. Never divide by zero or treat a null denominator as zero. `row_count` means five-minute source intervals, not distinct robots or events; use `robot_count` for distinct robots observed in a group and do not present it as simultaneous headcount. State assumptions and units, and round sensibly. If the question asks for an overall metric without naming a state, make one aggregate_runs call with state omitted rather than comparing every state. For lowest/highest average battery on a date, make exactly one call with date, group_by=[robot_id], metrics=[avg_battery], and no state. For a comparison of named robots, make one grouped call with group_by=[robot_id] and select the named rows; do not repeat the same query for every state. For a date efficiency trend, make one call with group_by=[date] and the requested metrics. After a tool result contains the requested comparison rows, answer from it instead of exploring other states. If the user says "full dataset" or "across all three days", omit date and start/end filters.
 The CSV column named field means farm field/location. Never put a metric name such as nitrogen_applied_l in field; metric names belong only in metrics.
 Format answers with Markdown: use **bold** for key results, headings with `##`, and bullet lists when useful. For equations, use `\\( ... \\)` for inline math and `$$ ... $$` for display math. For example, write `MR-01: \\(\\frac{{173.05}}{{16901}} \\approx 0.01024\\) L/m`, never `( \\frac{{...}} )` without delimiters. Never use bare `[` and `]` lines to delimit an equation. Do not wrap ordinary text in math delimiters.
 Always state the effective timeframe for time-based answers. If the user did not provide a date or date range, explicitly say "across the full dataset" and include the profile's start and end dates. Never call it a "selected timeframe" unless the user actually selected or supplied one.
-Use the full conversation history to resolve follow-ups, pronouns, and relative dates such as "the day before". Carry forward an earlier data limitation: if the prior question asked for unavailable weather or another missing field, a follow-up about another date is also unanswerable rather than an invitation to guess.
+Use the full conversation history to resolve follow-ups, pronouns, locations, and relative dates such as "the day before". Carry the requested date and environmental metric into the next turn: if you asked for a location and the user supplies one, call get_weather for that location and the original date. A follow-up about another date remains unavailable from the CSV, but supported weather or soil-moisture data may be retrieved externally after the user supplies a location.
 For fleet-wide rankings, totals by robot, and trends, make one aggregate_runs call with robot_id omitted and group_by set to robot_id or date. Use separate calls only when comparing explicitly named robots or when the first result is insufficient.
 
 DATASET PROFILE:
@@ -626,6 +663,22 @@ def build_visualization(trace: dict[str, Any]) -> dict[str, Any] | None:
             }
     if weather_candidates:
         _, step, rows = weather_candidates[-1]
+        soil_metrics = [
+            ("soil_moisture_0_to_7cm_m3_m3", "Soil moisture 0-7 cm (m³/m³)"),
+            ("soil_moisture_7_to_28cm_m3_m3", "Soil moisture 7-28 cm (m³/m³)"),
+            ("soil_moisture_28_to_100cm_m3_m3", "Soil moisture 28-100 cm (m³/m³)"),
+            ("soil_moisture_100_to_255cm_m3_m3", "Soil moisture 100-255 cm (m³/m³)"),
+        ]
+        soil_metric = next(((name, label) for name, label in soil_metrics if any(row.get(name) is not None for row in rows)), None)
+        if soil_metric:
+            metric, title = soil_metric
+            return {
+                "type": "bar",
+                "title": "External Open-Meteo: " + title,
+                "labels": [str(row.get("date")) for row in rows],
+                "datasets": [{"label": metric, "data": [float(row.get(metric) or 0) for row in rows]}],
+                "source_step_id": step.get("id"),
+            }
         metric = "temperature_mean_c" if any(row.get("temperature_mean_c") is not None for row in rows) else "precipitation_mm"
         labels = [str(row.get("date")) for row in rows]
         values = [float(row.get(metric) or 0) for row in rows]
@@ -787,8 +840,11 @@ LIMITATION_PHRASES = (
     "cannot answer", "can't answer", "could not answer", "not available", "isn't available",
     "not included", "contains no", "need a location", "provide a location", "what city",
     "what location", "coordinates should i use", "cannot determine", "can't determine",
-    "could not use",
+    "could not use", "doesn't contain", "does not contain", "doesn't include",
+    "does not include", "isn't included", "is not included", "not stored",
 )
+ENVIRONMENT_QUERY_TERMS = ("weather", "soil moisture", "temperature", "rain", "precipitation")
+LOCATION_REQUEST_PHRASES = ("what city", "which city", "what location", "which location", "provide a location", "coordinates should i use")
 
 
 def grounding_required(messages: list[Message]) -> bool:
@@ -799,6 +855,25 @@ def grounding_required(messages: list[Message]) -> bool:
 def reply_states_limitation(reply: str) -> bool:
     lowered = reply.lower().replace("’", "'")
     return any(phrase in lowered for phrase in LIMITATION_PHRASES)
+
+
+def ensure_environment_follow_up(messages: list[Message], reply: str, steps: list[dict[str, Any]]) -> str:
+    user_text = " ".join(message.content.lower() for message in messages if message.role == "user")
+    lowered_reply = reply.lower()
+    environmental = any(term in user_text for term in ENVIRONMENT_QUERY_TERMS)
+    weather_succeeded = any(
+        step.get("type") == "tool" and step.get("name") == "get_weather" and not step.get("error")
+        for step in steps
+    )
+    already_asks = any(phrase in lowered_reply for phrase in LOCATION_REQUEST_PHRASES)
+    if not environmental or weather_succeeded or already_asks or not reply_states_limitation(reply):
+        return reply
+    subject = "soil moisture" if "soil moisture" in user_text else "weather"
+    return (
+        reply.rstrip()
+        + f"\n\nI can look up external historical {subject} from Open-Meteo. "
+        + "What city, region, or coordinates should I use?"
+    )
 
 
 def run_chat(dataset: Dataset, messages: list[Message]) -> dict[str, Any]:
@@ -927,6 +1002,7 @@ def run_chat(dataset: Dataset, messages: list[Message]) -> dict[str, Any]:
             step for step in trace["steps"]
             if step.get("type") == "tool" and not step.get("error")
         ]
+        trace["reply"] = ensure_environment_follow_up(messages, trace["reply"], trace["steps"])
         required = grounding_required(messages)
         limitation = reply_states_limitation(trace["reply"])
         if successful_tools:
