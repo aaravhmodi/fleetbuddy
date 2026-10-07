@@ -24,6 +24,25 @@ Run the API-key-free tests with:
 pytest -q
 ```
 
+## Project layout
+
+`main.py` is only the entry point (`uvicorn main:app`). The code lives in `fleet_buddy/`:
+
+| File | What it does |
+|---|---|
+| `api.py` | HTTP endpoints and the NDJSON streaming helper |
+| `chat.py` | The model → tool → model loop; builds and stores each trace |
+| `tools.py` | `query_runs`, `aggregate_runs`, the tool schemas sent to the model, and `call_tool` |
+| `weather.py` | `get_weather` (Open-Meteo geocoding + archive) |
+| `data.py` | CSV validation, dataset profile, shared filters |
+| `prompt.py` | System prompt |
+| `grounding.py` | Grounding check and follow-up helpers |
+| `fallback.py` | Computed answers for a few known question shapes |
+| `evidence.py` | Chart, evidence summary, and LaTeX clean-up |
+| `evals.py` | Local eval scorer |
+| `analytics.py` | Dashboard aggregates over traces |
+| `config.py`, `schemas.py`, `state.py`, `utils.py` | Settings, request models, in-memory stores, small helpers |
+
 ## Design decisions
 
 The server keeps datasets and traces in process memory, as requested. A dataset is stored as a pandas DataFrame plus a profile. Upload validation requires exactly the seven expected columns, validates timestamps and states, accepts blank numeric cells, and reports those blanks in the profile. Timestamps are normalized to UTC.
@@ -42,7 +61,7 @@ Environmental data is deliberately marked as external evidence. The uploaded CSV
 
 Each chat turn gets a unique trace ID. A trace contains the complete conversation, prompt version, model configuration, ordered model/tool steps, response IDs, arguments, returned results, errors, durations, usage, hard-coded cost, final reply, and outcome. It also records traced-step time, orchestration time outside those steps, and timing coverage so the waterfall can explain the entire turn. Model pricing is intentionally explicit (`$0.15 / 1M` input tokens and `$0.60 / 1M` output tokens) so the analytics are deterministic and easy to replace. Tool errors are returned as structured function output, allowing the model to recover; eight model calls is the turn cap.
 
-The chat response returns the trace ID in both the JSON body (`trace_id`) and the `X-Trace-ID` response header. The optional `previous_trace_id` request field makes the preceding structured tool evidence available to a follow-up without creating server-side chat sessions. Reuse is limited to explicit evidence questions; a new date, entity, filter, or metric still requires a new tool call. The full trace is stored in the process-memory `TRACES` list in `main.py`, and can be retrieved with `GET /traces/{trace_id}`. `GET /traces` returns newest-first summaries. This is intentionally not persistent: traces disappear when the process restarts because the assignment requests an in-memory implementation. In a production version, this list would be replaced with a trace store or OpenTelemetry backend.
+The chat response returns the trace ID in both the JSON body (`trace_id`) and the `X-Trace-ID` response header. The optional `previous_trace_id` request field makes the preceding structured tool evidence available to a follow-up without creating server-side chat sessions. Reuse is limited to explicit evidence questions; a new date, entity, filter, or metric still requires a new tool call. The full trace is stored in the process-memory `TRACES` list in `fleet_buddy/state.py`, and can be retrieved with `GET /traces/{trace_id}`. `GET /traces` returns newest-first summaries. This is intentionally not persistent: traces disappear when the process restarts because the assignment requests an in-memory implementation. In a production version, this list would be replaced with a trace store or OpenTelemetry backend.
 
 Evaluation uses the same chat path and creates ordinary traces. The scorer is intentionally local rather than another model call: it requires all numeric/robot identifier facts, keeps robot IDs paired with their expected values, and applies a threshold to expected content words. This avoids contaminating analytics with judge calls and makes pass/fail reproducible. It is a lightweight smoke evaluator, not a substitute for human review.
 
@@ -50,7 +69,7 @@ For questions that require fleet data, the server enforces a grounding postcondi
 
 The chat loop also has a capped, data-driven fallback for a few high-value comparison shapes (lowest average battery, named-robot efficiency comparison, and lowest fleet-efficiency date). If the model spends its call budget exploring redundant filters, the fallback runs the corresponding aggregate against the uploaded dataset rather than inventing values; the fallback is recorded as a trace tool step and drives the visualization.
 
-The frontend is a single static page served by FastAPI. It includes upload/profile, chat, a live trace list, selectable step waterfall, analytics cards, two canvas charts, and the evaluation runner. Chat and evaluation requests use NDJSON streaming endpoints, so model passes, tool calls, errors, durations, and scoring appear as they happen rather than behind a static “thinking” state. Traces are refreshed after each completed turn without a page reload.
+The frontend is a single static page served by FastAPI. It includes upload/profile, chat, a live trace list, selectable step waterfall, analytics cards, two canvas charts, and the evaluation runner. Chat and evaluation requests use NDJSON streaming endpoints, so model passes, tool calls (with their arguments, shown as soon as each tool starts), errors, durations, and scoring appear as they happen, with an elapsed-time counter during long model calls, rather than behind a static “thinking” state. Traces are refreshed after each completed turn without a page reload.
 
 Each successful data-backed chat answer also includes an evidence disclosure in the UI. It shows the tools used, the effective timeframe, the filters passed to those tools, the number of tool-result rows, and whether a result was capped. The adjacent bar chart is generated from structured tool output, not from text invented by the model. The response exposes both `trace_id` and `X-Trace-ID` so a caller can correlate the answer with the full trace.
 
