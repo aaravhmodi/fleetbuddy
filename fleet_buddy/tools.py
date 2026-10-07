@@ -88,11 +88,13 @@ def run_aggregate_runs(dataset: Dataset, args: dict[str, Any]) -> dict[str, Any]
 
 
 # Tool descriptions sent to the model. The model reads these to decide which tool to call and
-# with what arguments. Every tool here also needs a matching branch in call_tool().
+# with what arguments. strict is off because the Responses API defaults to strict mode, which makes
+# every property required and forces the model to pick a state even when it wants no state filter. Every tool here also needs a matching branch in call_tool().
 TOOLS = [
     {
         "type": "function",
         "name": "query_runs",
+        "strict": False,
         "description": "Return up to 50 raw robot-run rows after filtering. Use this for exact timestamps and individual events such as faults.",
         "parameters": {
             "type": "object",
@@ -101,7 +103,7 @@ TOOLS = [
                 "date": {"type": "string", "description": "UTC calendar date YYYY-MM-DD"},
                 "start_date": {"type": "string"},
                 "end_date": {"type": "string"},
-                "state": {"type": "string", "enum": sorted(VALID_STATES)},
+                "state": {"type": "string", "enum": sorted(VALID_STATES), "description": "Only set this when the user explicitly names a state. Omit it for totals such as distance traveled or nitrogen applied, which cover every state."},
                 "field": {"type": "string", "description": "Farm field/location, such as North 40, Creekside, or Home Quarter. This is not a metric or CSV column name."},
                 "exclude_states": {"type": "array", "items": {"type": "string", "enum": sorted(VALID_STATES)}, "description": "States to exclude, for questions such as everything except idle."},
                 "exclude_robot_ids": {"type": "array", "items": {"type": "string"}},
@@ -114,6 +116,7 @@ TOOLS = [
     {
         "type": "function",
         "name": "aggregate_runs",
+        "strict": False,
         "description": "Aggregate robot-run metrics for comparisons, totals, rates, and counts. Use exclude_states, exclude_robot_ids, or exclude_fields for requests containing except, excluding, or without. efficiency_l_per_km is calculated server-side as sum nitrogen_applied_l / sum distance_m * 1000 and is null when distance is missing or zero. robot_count is the distinct robots observed in each group, not a simultaneous headcount. For fleet-wide rankings or trends, omit robot_id and use group_by to get all robots or dates in one call; do not call once per robot unless the user names specific robots. For named-robot comparisons, group by robot_id and select the requested rows. Each source row is a five-minute interval, so row_count for charging can be converted to minutes by multiplying by 5. Use date for a single UTC calendar day or start_date/end_date for a range, not both; omit all three for the full dataset. Omit any filter the user did not ask for instead of sending empty strings or lists, and only set state when the user names a state: totals such as distance traveled or nitrogen applied cover every state. For a fleet-wide total, omit group_by so the server sums it; never add up grouped rows yourself.",
         "parameters": {
             "type": "object",
@@ -122,7 +125,7 @@ TOOLS = [
                 "date": {"type": "string", "description": "UTC calendar date YYYY-MM-DD"},
                 "start_date": {"type": "string"},
                 "end_date": {"type": "string"},
-                "state": {"type": "string", "enum": sorted(VALID_STATES)},
+                "state": {"type": "string", "enum": sorted(VALID_STATES), "description": "Only set this when the user explicitly names a state. Omit it for totals such as distance traveled or nitrogen applied, which cover every state."},
                 "field": {"type": "string", "description": "Farm field/location, such as North 40, Creekside, or Home Quarter. This is not a metric or CSV column name."},
                 "exclude_states": {"type": "array", "items": {"type": "string", "enum": sorted(VALID_STATES)}, "description": "States to exclude, for questions such as everything except idle."},
                 "exclude_robot_ids": {"type": "array", "items": {"type": "string"}},
@@ -136,6 +139,7 @@ TOOLS = [
     {
         "type": "function",
         "name": "get_weather",
+        "strict": False,
         "description": "Retrieve historical weather or soil-moisture reanalysis from Open-Meteo for a supplied city/location or latitude and longitude. The CSV has no coordinates, so never infer a farm location from field names. If the user asks for soil moisture, set data_type to soil_moisture. Use this only when the user supplies a location or coordinates; otherwise ask for the location. Results are external data and must be labeled as such.",
         "parameters": {
             "type": "object",

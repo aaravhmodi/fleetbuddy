@@ -27,8 +27,7 @@ def question_date(question: str) -> str | None:
 
 def fallback_aggregate_answer(dataset: Dataset, question: str) -> tuple[str, dict[str, Any], dict[str, Any]] | None:
     """Answer a few high-value analytical shapes if the model exhausts its call budget."""
-    # Note: run_chat calls this after every turn, so when a question matches one of these
-    # patterns, this computed answer replaces the model's answer.
+    # run_chat only calls this when a turn stopped at the model-call cap.
     lowered = question.lower()
     if "state" in lowered and any(state in lowered for state in VALID_STATES):
         return None

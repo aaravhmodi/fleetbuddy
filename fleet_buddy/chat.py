@@ -20,6 +20,7 @@ from .grounding import (
     previous_trace_context,
     question_requests_evidence_reuse,
     reply_states_limitation,
+    unrequested_state_error,
 )
 from .prompt import SYSTEM_PROMPT_TEMPLATE
 from .schemas import Message
@@ -159,6 +160,9 @@ def run_chat(
                     if not isinstance(parsed_args, dict):
                         raise ValueError("Tool arguments must be a JSON object.")
                     args = parsed_args
+                    state_error = unrequested_state_error(args, messages)
+                    if state_error:
+                        raise ValueError(state_error)
                     result = call_tool(dataset, name, args)
                     tool_error = None
                 except Exception as exc:  # Tool errors are intentionally returned to the model.
@@ -185,7 +189,8 @@ def run_chat(
         else:
             trace["outcome"] = "stopped_at_cap"
             reply = "I stopped after reaching the model-call limit before I could finish the answer."
-        fallback = fallback_aggregate_answer(dataset, trace["question"])
+        # Only rescue a turn that ran out of model calls; the outcome stays stopped_at_cap.
+        fallback = fallback_aggregate_answer(dataset, trace["question"]) if trace["outcome"] == "stopped_at_cap" else None
         if fallback:
             fallback_reply, fallback_args, fallback_result = fallback
             fallback_step = {
@@ -203,7 +208,6 @@ def run_chat(
             trace["steps"].append(fallback_step)
             emit("step", trace_id=trace["id"], step=fallback_step)
             trace["fallback_used"] = True
-            trace["outcome"] = "answered"
             reply = fallback_reply
         trace["reply"] = reply or "I could not produce an answer from the available data."
         successful_tools = [
@@ -225,7 +229,8 @@ def run_chat(
             grounding_status = "limitation"
         elif required:
             grounding_status = "missing_tool_evidence"
-            trace["outcome"] = "ungrounded"
+            if trace["outcome"] == "answered":  # keep stopped_at_cap visible in traces and analytics
+                trace["outcome"] = "ungrounded"
             trace["reply"] = "I couldn't verify that answer from tool results, so I won't guess."
         else:
             grounding_status = "not_required"

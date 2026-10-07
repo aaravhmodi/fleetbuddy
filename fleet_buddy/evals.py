@@ -29,10 +29,26 @@ def numeric_fact_value(token: str) -> float | None:
         return None
 
 
-def fact_is_present(token: str, actual: str, actual_numbers: list[float]) -> bool:
+def reply_numbers(text: str) -> list[tuple[float, float]]:
+    # Each number in the reply with how far it may sit from the expected value. A reply that rounds
+    # to fewer decimals (45.3 for 45.27) still matches; whole numbers stay strict (45 never matches 45.27).
+    numbers = []
+    for match in NUMERIC_VALUE_RE.finditer(text):
+        raw = match.group(0).rstrip("%").replace(",", "")
+        decimals = len(raw.split(".")[1]) if "." in raw else 0
+        tolerance = max(0.01, 0.5 * 10 ** -decimals + 1e-9) if decimals else 0.01
+        numbers.append((float(raw), tolerance))
+    return numbers
+
+
+def number_matches(expected: float, candidates: list[tuple[float, float]]) -> bool:
+    return any(abs(expected - value) <= tolerance for value, tolerance in candidates)
+
+
+def fact_is_present(token: str, actual: str, actual_numbers: list[tuple[float, float]]) -> bool:
     expected_number = numeric_fact_value(token)
     if expected_number is not None:
-        return any(abs(expected_number - candidate) <= 0.01 for candidate in actual_numbers)
+        return number_matches(expected_number, actual_numbers)
     return token in actual
 
 
@@ -52,11 +68,8 @@ def paired_facts_are_present(actual: str, expected: str) -> tuple[bool, str | No
                     continue
                 segment_end = actual_id_matches[index + 1].start() if index + 1 < len(actual_id_matches) else min(len(actual), match.end() + 300)
                 segment = actual[match.start():segment_end]
-                segment_numbers = [
-                    float(number.group(0).rstrip("%").replace(",", ""))
-                    for number in NUMERIC_VALUE_RE.finditer(segment)
-                ]
-                if all(any(abs(value - candidate) <= 0.01 for candidate in segment_numbers) for value in expected_numbers):
+                segment_numbers = reply_numbers(segment)
+                if all(number_matches(value, segment_numbers) for value in expected_numbers):
                     found_pair = True
                     break
             if not found_pair:
@@ -78,10 +91,7 @@ def score_reply(reply: str, expected: str) -> tuple[bool, str]:
         return False, pairing_reason or "expected fact pairing not found"
     target_tokens = [token for token in target.split() if token not in {"the", "a", "an", "is", "was", "of", "on", "and", "to", "in", "for", "with"}]
     numeric_or_ids = [token for token in target_tokens if any(character.isdigit() for character in token) or token.startswith("mr-")]
-    actual_numbers = [
-        float(match.group(0).rstrip("%").replace(",", ""))
-        for match in NUMERIC_VALUE_RE.finditer(reply)
-    ]
+    actual_numbers = reply_numbers(reply)
     missing_facts = [token for token in numeric_or_ids if not fact_is_present(token, actual, actual_numbers)]
     if missing_facts:
         return False, f"missing key fact(s): {', '.join(missing_facts)}"

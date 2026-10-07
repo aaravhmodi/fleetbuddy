@@ -35,6 +35,31 @@ LOCATION_REQUEST_RE = re.compile(
 )
 
 
+# Word stems a user might use to name each state ("applied", "drove", "charge", "faults", ...).
+STATE_STEMS = {
+    "applying": ("appl", "spread", "fertiliz"),
+    "driving": ("driv", "drove", "transit"),
+    "charging": ("charg",),
+    "idle": ("idle",),
+    "fault": ("fault", "error", "fail"),
+}
+
+
+def unrequested_state_error(args: dict[str, Any], messages: list[Message]) -> str | None:
+    # Models like to narrow "total distance" to one state on their own. If the user never
+    # mentioned that state, send an error back so the model retries without the filter.
+    state_filter = args.get("state")
+    if not state_filter or state_filter not in STATE_STEMS:
+        return None
+    user_text = " ".join(message.content.lower() for message in messages if message.role == "user")
+    if any(stem in user_text for stem in STATE_STEMS[state_filter]):
+        return None
+    return (
+        f"state='{state_filter}' was not requested by the user. Omit state so the result "
+        "covers every state, unless the user explicitly asks about one."
+    )
+
+
 def grounding_required(messages: list[Message]) -> bool:
     user_text = " ".join(message.content.lower() for message in messages if message.role == "user")
     return any(re.search(rf"\b{re.escape(term)}s?\b", user_text) for term in DATA_QUESTION_TERMS)

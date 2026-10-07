@@ -125,6 +125,25 @@ def test_date_conflicting_with_wider_range_is_an_error(dataset: Dataset) -> None
         })
 
 
+def test_scorer_accepts_rounding_but_not_wrong_values() -> None:
+    expected = "MR-03 approximately 45.27% average battery"
+    assert score_reply("MR-03 averaged 45.3% battery", expected)[0]
+    assert not score_reply("MR-03 averaged 45% battery", expected)[0]
+    assert not score_reply("MR-03 averaged 46.3% battery", expected)[0]
+
+
+def test_unrequested_state_filter_is_rejected() -> None:
+    from fleet_buddy.grounding import unrequested_state_error
+
+    distance = [Message(role="user", content="Which robot had the greatest total distance traveled?")]
+    assert unrequested_state_error({"state": "applying"}, distance)
+    assert unrequested_state_error({}, distance) is None
+    nitrogen = [Message(role="user", content="Which robot applied the most nitrogen?")]
+    assert unrequested_state_error({"state": "applying"}, nitrogen) is None
+    faults = [Message(role="user", content="How many times did MR-03 fault?")]
+    assert unrequested_state_error({"state": "fault"}, faults) is None
+
+
 def test_location_only_weather_reply_states_csv_limitation() -> None:
     from fleet_buddy.grounding import ensure_environment_follow_up, reply_states_limitation
 
