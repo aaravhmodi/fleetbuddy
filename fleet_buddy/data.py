@@ -13,7 +13,13 @@ from .state import Dataset
 from .utils import json_safe
 
 
-def profile_frame(frame: pd.DataFrame) -> dict[str, Any]:
+IDENTITY_COLUMNS = ["ts", "robot_id", "field", "state"]
+NUMERIC_COLUMNS = ["battery_pct", "nitrogen_applied_l", "distance_m"]
+
+
+def profile_frame(
+    frame: pd.DataFrame, dropped_rows: int = 0, warnings: list[str] | None = None
+) -> dict[str, Any]:
     # A summary of the dataset (columns, date range, robots, fields). This is what the model
     # sees in its prompt; it never sees the raw rows.
     type_names: dict[str, str] = {
@@ -28,6 +34,8 @@ def profile_frame(frame: pd.DataFrame) -> dict[str, Any]:
     return {
         "columns": [{"name": name, "type": type_names[name]} for name in EXPECTED_COLUMNS],
         "row_count": int(len(frame)),
+        "source_row_count": int(len(frame)) + dropped_rows,
+        "dropped_row_count": dropped_rows,
         "time_range": {
             "start": frame["ts"].min().isoformat().replace("+00:00", "Z"),
             "end": frame["ts"].max().isoformat().replace("+00:00", "Z"),
@@ -36,17 +44,25 @@ def profile_frame(frame: pd.DataFrame) -> dict[str, Any]:
         "fields": sorted(frame["field"].dropna().unique().tolist()),
         "states": sorted(frame["state"].dropna().unique().tolist()),
         "missing_values": {column: int(frame[column].isna().sum()) for column in EXPECTED_COLUMNS},
+        "warnings": list(warnings or []),
         "notes": [
             "ts is normalized to UTC.",
+            "Rows with a blank ts, robot_id, field or state are dropped before analysis.",
             "Numeric blanks are retained as null and ignored by aggregations.",
             "Each source row represents a five-minute robot interval.",
         ],
     }
 
 
+def is_blank(series: pd.Series) -> pd.Series:
+    return series.isna() | series.astype(str).str.strip().eq("")
+
+
 def parse_dataset(raw: bytes) -> tuple[pd.DataFrame, dict[str, Any]]:
     # Reads the uploaded CSV and rejects wrong columns, bad timestamps, unknown states,
-    # or impossible numbers (e.g. battery over 100%). Blank numbers are allowed.
+    # or impossible numbers (negatives, battery over 100%). Blank cells don't stop the
+    # upload: rows missing an identity column are dropped, numeric blanks stay null, and
+    # each case is reported in profile["warnings"].
     if not raw:
         raise ValueError("The CSV file is empty.")
     try:
@@ -65,32 +81,45 @@ def parse_dataset(raw: bytes) -> tuple[pd.DataFrame, dict[str, Any]]:
             pieces.append(f"unexpected columns: {', '.join(extra)}")
         raise ValueError("Unexpected robot run shape; " + "; ".join(pieces) + ".")
     frame = frame[EXPECTED_COLUMNS].copy()
+
+    warnings: list[str] = []
+    blank_rows = pd.Series(False, index=frame.index)
+    for column in IDENTITY_COLUMNS:
+        blank = is_blank(frame[column])
+        if blank.any():
+            warnings.append(f"Ignored {int(blank.sum())} row(s) with a blank {column}.")
+            blank_rows |= blank
+    dropped_rows = int(blank_rows.sum())
+    if dropped_rows == len(frame):
+        raise ValueError(f"All {dropped_rows} row(s) have a blank ts, robot_id, field or state; nothing to analyze.")
+    frame = frame[~blank_rows].reset_index(drop=True)
+
     timestamps = pd.to_datetime(frame["ts"], utc=True, errors="coerce")
     if timestamps.isna().any():
         count = int(timestamps.isna().sum())
-        raise ValueError(f"ts contains {count} invalid or blank timestamp(s); expected ISO 8601 values.")
+        raise ValueError(f"ts contains {count} invalid timestamp(s); expected ISO 8601 values.")
     frame["ts"] = timestamps
-    if frame["robot_id"].isna().any() or frame["robot_id"].astype(str).str.strip().eq("").any():
-        raise ValueError("robot_id cannot be blank.")
-    if frame["field"].isna().any() or frame["state"].isna().any():
-        raise ValueError("field and state cannot be blank.")
     frame["robot_id"] = frame["robot_id"].astype(str).str.strip()
     frame["field"] = frame["field"].astype(str).str.strip()
     frame["state"] = frame["state"].astype(str).str.strip().str.lower()
     bad_states = sorted(set(frame["state"]) - VALID_STATES)
     if bad_states:
         raise ValueError(f"state contains unsupported value(s): {', '.join(bad_states)}.")
-    for column in ["battery_pct", "nitrogen_applied_l", "distance_m"]:
+    for column in NUMERIC_COLUMNS:
+        blank = is_blank(frame[column])
+        if blank.any():
+            warnings.append(
+                f"{column} has {int(blank.sum())} blank value(s); they are kept as null and ignored by aggregations."
+            )
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
-    if frame["battery_pct"].dropna().lt(0).any() or frame["battery_pct"].dropna().gt(100).any():
-        raise ValueError("battery_pct must be between 0 and 100.")
-    for column in ["nitrogen_applied_l", "distance_m"]:
         values = frame[column].dropna()
         if not values.map(math.isfinite).all():
             raise ValueError(f"{column} must contain finite numeric values.")
         if values.lt(0).any():
-            raise ValueError(f"{column} cannot contain negative values.")
-    return frame, profile_frame(frame)
+            raise ValueError(f"{column} cannot contain negative values ({int(values.lt(0).sum())} found).")
+    if frame["battery_pct"].dropna().gt(100).any():
+        raise ValueError("battery_pct must be between 0 and 100.")
+    return frame, profile_frame(frame, dropped_rows, warnings)
 
 
 def parse_date(value: str | None) -> pd.Timestamp | None:

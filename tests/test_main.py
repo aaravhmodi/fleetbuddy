@@ -160,6 +160,64 @@ def test_parse_rejects_negative_measurements() -> None:
         parse_dataset(raw)
 
 
+HEADER = b"ts,robot_id,field,state,battery_pct,nitrogen_applied_l,distance_m\n"
+
+
+@pytest.mark.parametrize("column", ["battery_pct", "nitrogen_applied_l", "distance_m"])
+def test_parse_rejects_negative_values_in_every_numeric_column(column: str) -> None:
+    values = {"battery_pct": "50", "nitrogen_applied_l": "1", "distance_m": "2"}
+    values[column] = "-0.5"
+    row = f"2026-01-01T00:00:00Z,MR-01,F,driving,{values['battery_pct']},{values['nitrogen_applied_l']},{values['distance_m']}\n"
+    with pytest.raises(ValueError, match=f"{column} cannot contain negative values"):
+        parse_dataset(HEADER + row.encode())
+
+
+def test_parse_ignores_blank_cells_and_reports_them() -> None:
+    raw = HEADER + (
+        b"2026-01-01T00:00:00Z,MR-01,F,driving,50,1,2\n"
+        b",MR-01,F,driving,50,1,2\n"  # blank ts
+        b"2026-01-01T00:05:00Z,,F,driving,50,1,2\n"  # blank robot_id
+        b"2026-01-01T00:10:00Z,MR-02,  ,driving,50,1,2\n"  # whitespace-only field
+        b"2026-01-01T00:15:00Z,MR-02,F,,50,1,2\n"  # blank state
+        b"2026-01-01T00:20:00Z,MR-02,F,driving,,,\n"  # blank numerics are kept as null
+        b",,,,,,\n"  # entirely blank row
+    )
+    frame, profile = parse_dataset(raw)
+    assert len(frame) == 2
+    assert profile["row_count"] == 2
+    assert profile["source_row_count"] == 7
+    assert profile["dropped_row_count"] == 5
+    assert frame["distance_m"].sum() == 2  # the null distance is skipped, not counted
+    assert profile["missing_values"]["battery_pct"] == 1
+    warnings = " ".join(profile["warnings"])
+    for expected in [
+        "Ignored 2 row(s) with a blank ts",
+        "Ignored 2 row(s) with a blank robot_id",
+        "Ignored 2 row(s) with a blank field",
+        "Ignored 2 row(s) with a blank state",
+        "battery_pct has 1 blank value(s)",
+        "nitrogen_applied_l has 1 blank value(s)",
+        "distance_m has 1 blank value(s)",
+    ]:
+        assert expected in warnings
+
+
+def test_parse_rejects_when_every_row_is_blank() -> None:
+    with pytest.raises(ValueError, match="All 2 row"):
+        parse_dataset(HEADER + b",MR-01,F,driving,50,1,2\n2026-01-01T00:00:00Z,,F,driving,50,1,2\n")
+
+
+def test_parse_still_rejects_malformed_non_blank_timestamp() -> None:
+    with pytest.raises(ValueError, match="invalid timestamp"):
+        parse_dataset(HEADER + b"not-a-date,MR-01,F,driving,50,1,2\n")
+
+
+def test_clean_upload_has_no_warnings() -> None:
+    _, profile = parse_dataset(HEADER + b"2026-01-01T00:00:00Z,MR-01,F,driving,50,1,2\n")
+    assert profile["warnings"] == []
+    assert profile["dropped_row_count"] == 0
+
+
 def test_server_normalizes_model_latex_delimiters() -> None:
     reply = normalize_latex_response(r"""[
 \text{Efficiency} = \frac{\text{Total Nitrogen Applied (L)}}{\text{Total Distance Traveled (m)}}
