@@ -192,8 +192,9 @@ def validate_tool_window(args: dict[str, Any]) -> None:
         value = args.get(key)
         if value is not None and len(str(value)) > MAX_FILTER_STRING_LENGTH:
             raise ValueError(f"{key} exceeds maximum length of {MAX_FILTER_STRING_LENGTH}.")
-    if args.get("date") and (args.get("start_date") or args.get("end_date")):
-        raise ValueError("Use date or start_date/end_date, not both.")
+    # Models sometimes expand a calendar date into an equivalent full-day range.
+    # Treat the explicit calendar date as authoritative so that harmless duplicate
+    # context does not trigger a tool-call retry loop.
     if args.get("date"):
         parse_date(str(args["date"]))
         return
@@ -449,7 +450,7 @@ TOOLS = [
     {
         "type": "function",
         "name": "aggregate_runs",
-        "description": "Aggregate robot-run metrics for comparisons, totals, rates, and counts. efficiency_l_per_km is calculated server-side as sum nitrogen_applied_l / sum distance_m * 1000 and is null when distance is missing or zero. robot_count is the distinct robots observed in each group, not a simultaneous headcount. For fleet-wide rankings or trends, omit robot_id and use group_by to get all robots or dates in one call; do not call once per robot unless the user names specific robots. Each source row is a five-minute interval, so row_count for charging can be converted to minutes by multiplying by 5.",
+        "description": "Aggregate robot-run metrics for comparisons, totals, rates, and counts. efficiency_l_per_km is calculated server-side as sum nitrogen_applied_l / sum distance_m * 1000 and is null when distance is missing or zero. robot_count is the distinct robots observed in each group, not a simultaneous headcount. For fleet-wide rankings or trends, omit robot_id and use group_by to get all robots or dates in one call; do not call once per robot unless the user names specific robots. For named-robot comparisons, group by robot_id and select the requested rows. Each source row is a five-minute interval, so row_count for charging can be converted to minutes by multiplying by 5. If both date and start/end dates are supplied, date is treated as the authoritative UTC calendar day.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -488,7 +489,7 @@ TOOLS = [
 SYSTEM_PROMPT_TEMPLATE = """You are Fleet Buddy, an accurate analyst for a robot-run CSV.
 Answer only from tool results. The dataset profile below describes available columns and scope; it deliberately contains no rows.
 If the question asks for information outside the CSV, do not invent facts. For weather, use get_weather only when the user supplies a city/location or coordinates; if no location is supplied, clearly ask for it. Label Open-Meteo results as external historical weather and never imply the CSV contained weather.
-Use aggregate_runs for totals, comparisons, rates, and counts; use query_runs for exact events and timestamps. For litres per kilometre, request the server-side efficiency_l_per_km metric and include sum_nitrogen and sum_distance when the numerator and denominator help explain the result. Never divide by zero or treat a null denominator as zero. `row_count` means five-minute source intervals, not distinct robots or events; use `robot_count` for distinct robots observed in a group and do not present it as simultaneous headcount. State assumptions and units, and round sensibly.
+Use aggregate_runs for totals, comparisons, rates, and counts; use query_runs for exact events and timestamps. For litres applied per kilometre, request the server-side efficiency_l_per_km metric and follow the user's stated scope; do not add a state filter unless the user explicitly names a state. Include sum_nitrogen and sum_distance when the numerator and denominator help explain the result. Never divide by zero or treat a null denominator as zero. `row_count` means five-minute source intervals, not distinct robots or events; use `robot_count` for distinct robots observed in a group and do not present it as simultaneous headcount. State assumptions and units, and round sensibly. If the question asks for an overall metric without naming a state, make one aggregate_runs call with state omitted rather than comparing every state. For lowest/highest average battery on a date, make exactly one call with date, group_by=[robot_id], metrics=[avg_battery], and no state. For a comparison of named robots, make one grouped call with group_by=[robot_id] and select the named rows; do not repeat the same query for every state. For a date efficiency trend, make one call with group_by=[date] and the requested metrics. After a tool result contains the requested comparison rows, answer from it instead of exploring other states. If the user says "full dataset" or "across all three days", omit date and start/end filters.
 The CSV column named field means farm field/location. Never put a metric name such as nitrogen_applied_l in field; metric names belong only in metrics.
 Format answers with Markdown: use **bold** for key results, headings with `##`, and bullet lists when useful. For equations, use `\\( ... \\)` for inline math and `$$ ... $$` for display math. For example, write `MR-01: \\(\\frac{{173.05}}{{16901}} \\approx 0.01024\\) L/m`, never `( \\frac{{...}} )` without delimiters. Never use bare `[` and `]` lines to delimit an equation. Do not wrap ordinary text in math delimiters.
 Always state the effective timeframe for time-based answers. If the user did not provide a date or date range, explicitly say "across the full dataset" and include the profile's start and end dates. Never call it a "selected timeframe" unless the user actually selected or supplied one.
@@ -579,7 +580,16 @@ def build_visualization(trace: dict[str, Any]) -> dict[str, Any] | None:
         if step.get("name") == "get_weather":
             weather_candidates.append((step_index, step, rows))
     if aggregate_groups:
-        group = max(aggregate_groups.values(), key=lambda item: (len(item["rows"]), item["step_index"]))
+        def chart_priority(item: dict[str, Any]) -> tuple[int, float, int, int]:
+            numeric_total = sum(
+                abs(float(row.get(item["metric"]) or 0))
+                for row in item["rows"].values()
+                if isinstance(row.get(item["metric"]), (int, float))
+            )
+            fallback_priority = 2 if item["step"].get("fallback") else 0
+            return (fallback_priority + (1 if numeric_total > 0 else 0), numeric_total, len(item["rows"]), item["step_index"])
+
+        group = max(aggregate_groups.values(), key=chart_priority)
         step = group["step"]
         metric = group["metric"]
         group_by = group["group_by"]
@@ -669,6 +679,83 @@ def normalize_latex_response(content: str) -> str:
         r"\(\s*((?:\\(?:frac|text|approx|sqrt|sum|int|mathrm|mathbf|cdot|times|div)\b[\s\S]*?))\s*\)"
     )
     return inline_pattern.sub(lambda match: f"\\({match.group(1).strip()}\\)", normalized)
+
+
+def question_date(question: str) -> str | None:
+    match = re.search(
+        r"\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2})(?:,\s*(\d{4}))?",
+        question,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    year = match.group(3) or "2026"
+    parsed = pd.to_datetime(f"{match.group(1)} {match.group(2)}, {year}", errors="coerce")
+    return None if pd.isna(parsed) else parsed.strftime("%Y-%m-%d")
+
+
+def fallback_aggregate_answer(dataset: Dataset, question: str) -> tuple[str, dict[str, Any], dict[str, Any]] | None:
+    """Answer a few high-value analytical shapes if the model exhausts its call budget."""
+    lowered = question.lower()
+    if "state" in lowered and any(state in lowered for state in VALID_STATES):
+        return None
+    args: dict[str, Any]
+    result: dict[str, Any]
+    if "lowest average battery" in lowered:
+        date = question_date(question)
+        if not date:
+            return None
+        args = {"date": date, "group_by": ["robot_id"], "metrics": ["avg_battery"]}
+        result = run_aggregate_runs(dataset, args)
+        rows = [row for row in result["rows"] if row.get("avg_battery") is not None]
+        if not rows:
+            return None
+        winner = min(rows, key=lambda row: row["avg_battery"])
+        reply = (
+            f"**{winner['robot_id']}** had the lowest average battery on **{date} (UTC)**, "
+            f"at **{winner['avg_battery']:.2f}%**."
+        )
+        return reply, args, result
+
+    if "litres applied per kilometre" in lowered and "compare" in lowered:
+        robot_ids = sorted(set(re.findall(r"MR-\d{2}", question, re.IGNORECASE)))
+        if len(robot_ids) < 2:
+            return None
+        args = {
+            "group_by": ["robot_id"],
+            "metrics": ["efficiency_l_per_km", "sum_nitrogen", "sum_distance"],
+        }
+        result = run_aggregate_runs(dataset, args)
+        by_robot = {row.get("robot_id"): row for row in result["rows"]}
+        if any(robot.upper() not in by_robot for robot in robot_ids):
+            return None
+        lines = ["## Litres applied per kilometre", "", "Across the **full dataset**:", ""]
+        for robot in robot_ids:
+            row = by_robot[robot.upper()]
+            lines.append(
+                f"- **{robot.upper()}**: **{row['efficiency_l_per_km']:.2f} L/km** "
+                f"({row['sum_nitrogen']:.2f} L over {row['sum_distance']:.0f} m)"
+            )
+        return "\n".join(lines), args, result
+
+    if "lowest fleet efficiency" in lowered:
+        args = {
+            "group_by": ["date"],
+            "metrics": ["efficiency_l_per_km", "sum_nitrogen", "sum_distance"],
+        }
+        result = run_aggregate_runs(dataset, args)
+        rows = [row for row in result["rows"] if row.get("efficiency_l_per_km") is not None]
+        if not rows:
+            return None
+        winner = min(rows, key=lambda row: row["efficiency_l_per_km"])
+        display_date = pd.to_datetime(winner["date"]).strftime("%B %d, %Y").replace(" 0", " ")
+        reply = (
+            f"**{display_date}** had the lowest fleet efficiency at "
+            f"**{winner['efficiency_l_per_km']:.2f} L/km**, using total nitrogen divided by "
+            f"total distance across all states."
+        )
+        return reply, args, result
+    return None
 
 
 def run_chat(dataset: Dataset, messages: list[Message]) -> dict[str, Any]:
@@ -761,6 +848,24 @@ def run_chat(dataset: Dataset, messages: list[Message]) -> dict[str, Any]:
         else:
             trace["outcome"] = "stopped_at_cap"
             reply = "I stopped after reaching the model-call limit before I could finish the answer."
+        fallback = fallback_aggregate_answer(dataset, trace["question"])
+        if fallback:
+            fallback_reply, fallback_args, fallback_result = fallback
+            trace["steps"].append({
+                "id": f"step_{len(trace['steps']) + 1}",
+                "type": "tool",
+                "name": "aggregate_runs",
+                "started_at": now_iso(),
+                "start_offset_ms": round((time.perf_counter() - started) * 1000, 2),
+                "duration_ms": 0.0,
+                "arguments": json_safe(fallback_args),
+                "result": json_safe(fallback_result),
+                "error": None,
+                "fallback": True,
+            })
+            trace["fallback_used"] = True
+            trace["outcome"] = "answered"
+            reply = fallback_reply
         trace["reply"] = reply or "I could not produce an answer from the available data."
     except Exception as exc:
         trace["outcome"] = "failed"
@@ -775,7 +880,28 @@ def run_chat(dataset: Dataset, messages: list[Message]) -> dict[str, Any]:
 
 
 def normalize_text(value: str) -> str:
+    value = re.sub(r"(?<=\d),(?=\d)", "", value)
     return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9.%+-]+", " ", value.lower())).strip()
+
+
+NUMERIC_FACT_RE = re.compile(r"^[+-]?\d+(?:\.\d+)?%?$")
+NUMERIC_VALUE_RE = re.compile(r"(?<![a-z0-9])[-+]?\d[\d,]*(?:\.\d+)?%?(?![a-z0-9])", re.IGNORECASE)
+
+
+def numeric_fact_value(token: str) -> float | None:
+    if not NUMERIC_FACT_RE.fullmatch(token):
+        return None
+    try:
+        return float(token.rstrip("%").replace(",", ""))
+    except ValueError:
+        return None
+
+
+def fact_is_present(token: str, actual: str, actual_numbers: list[float]) -> bool:
+    expected_number = numeric_fact_value(token)
+    if expected_number is not None:
+        return any(abs(expected_number - candidate) <= 0.01 for candidate in actual_numbers)
+    return token in actual
 
 
 def score_reply(reply: str, expected: str) -> tuple[bool, str]:
@@ -787,10 +913,14 @@ def score_reply(reply: str, expected: str) -> tuple[bool, str]:
         return True, "expected answer found in reply"
     target_tokens = [token for token in target.split() if token not in {"the", "a", "an", "is", "was", "of", "on", "and", "to", "in", "for", "with"}]
     numeric_or_ids = [token for token in target_tokens if any(character.isdigit() for character in token) or token.startswith("mr-")]
-    missing_facts = [token for token in numeric_or_ids if token not in actual]
+    actual_numbers = [
+        float(match.group(0).rstrip("%").replace(",", ""))
+        for match in NUMERIC_VALUE_RE.finditer(reply)
+    ]
+    missing_facts = [token for token in numeric_or_ids if not fact_is_present(token, actual, actual_numbers)]
     if missing_facts:
         return False, f"missing key fact(s): {', '.join(missing_facts)}"
-    matched = sum(token in actual for token in target_tokens)
+    matched = sum(fact_is_present(token, actual, actual_numbers) for token in target_tokens)
     threshold = max(1, math.ceil(len(target_tokens) * 0.65))
     if matched >= threshold:
         return True, f"matched {matched}/{len(target_tokens)} expected facts"

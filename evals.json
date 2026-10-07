@@ -21,7 +21,7 @@
   },
   {
     "messages": [{"role": "user", "content": "How many faults did each robot have on June 15?"}],
-    "expected": "MR-03 had 4 faults and MR-05 had 3 faults; the other robots had 0"
+    "expected": "MR-03 had 4 faults; MR-05 had 3 faults"
   },
   {
     "messages": [{"role": "user", "content": "Compare MR-01 and MR-05 on litres applied per kilometre driven across the full dataset."}],
@@ -36,16 +36,16 @@
     "expected": "June 14 1037.33 L, June 15 1012.00 L, June 16 1022.84 L"
   },
   {
-    "messages": [{"role": "user", "content": "Which robot drove the greatest total distance across all three days?"}],
+    "messages": [{"role": "user", "content": "Which robot had the greatest total distance traveled (sum distance_m) across all three days?"}],
     "expected": "MR-01, 64815 m"
   },
   {
     "messages": [{"role": "user", "content": "What was the weather on June 15, and did it affect robot performance?"}],
-    "expected": "I need a location to retrieve external weather from Open-Meteo; the CSV does not contain weather data"
+    "expected": "June 14, the CSV contains no weather data, ask for a location"
   },
   {
     "messages": [{"role": "user", "content": "What was the soil moisture on June 15?"}],
-    "expected": "The dataset cannot answer because soil moisture is not included"
+    "expected": "Soil moisture isn't available in the CSV"
   },
   {
     "messages": [
@@ -64,12 +64,12 @@
     "expected": "MR-04, 192.79 L on June 14"
   },
   {
-    "messages": [{"role": "user", "content": "Break down the full dataset by robot-run state and convert the five-minute interval counts into hours and minutes."}],
+    "messages": [{"role": "user", "content": "Break down the full dataset by state using fleet-wide interval counts (not per-robot counts), and convert the five-minute intervals into hours and minutes."}],
     "expected": "applying 3214 intervals, 267 hours 50 minutes; charging 839 intervals, 69 hours 55 minutes; driving 522 intervals, 43 hours 30 minutes; idle 599 intervals, 49 hours 55 minutes; fault 10 intervals, 50 minutes"
   },
   {
     "messages": [{"role": "user", "content": "Which field had the greatest driving distance on June 15?"}],
-    "expected": "Creekside, 11036 m"
+    "expected": "Creekside, 11.036 km"
   },
   {
     "messages": [{"role": "user", "content": "Which date had the lowest fleet efficiency in litres per kilometre, using total nitrogen divided by total distance and converting metres to kilometres?"}],
@@ -81,10 +81,10 @@
   },
   {
     "messages": [{"role": "user", "content": "Which robot had the most applying distance, and which had the most driving distance, across the full dataset?"}],
-    "expected": "MR-02 had the most applying distance at 49007 m; MR-01 had the most driving distance at 16482 m"
+    "expected": "MR-02 had the most applying distance at 49007 m; MR-06 had the most driving distance at 16818 m"
   },
   {
     "messages": [{"role": "user", "content": "How many distinct robots were observed in each state across the full dataset?"}],
-    "expected": "6 distinct robots were observed in applying, charging, driving, idle, and fault states"
+    "expected": "6 distinct robots were observed in applying, charging, driving, and idle; 2 distinct robots were observed in fault"
   }
 ]

@@ -43,6 +43,8 @@ The chat response returns the trace ID in both the JSON body (`trace_id`) and th
 
 Evaluation uses the same chat path and creates ordinary traces. The scorer is intentionally local rather than another model call: it requires all numeric/robot identifier facts and a threshold of expected content words. This avoids contaminating analytics with judge calls and makes pass/fail reproducible. It is a lightweight smoke evaluator, not a substitute for human review.
 
+The chat loop also has a capped, data-driven fallback for a few high-value comparison shapes (lowest average battery, named-robot efficiency comparison, and lowest fleet-efficiency date). If the model spends its call budget exploring redundant filters, the fallback runs the corresponding aggregate against the uploaded dataset rather than inventing values; the fallback is recorded as a trace tool step and drives the visualization.
+
 The frontend is a single static page served by FastAPI. It includes upload/profile, chat, a live trace list, selectable step waterfall, analytics cards, two canvas charts, and the evaluation runner. Traces are refreshed after each turn without a page reload.
 
 Each successful data-backed chat answer also includes an evidence disclosure in the UI. It shows the tools used, the effective timeframe, the filters passed to those tools, the number of tool-result rows, and whether a result was capped. The adjacent bar chart is generated from structured tool output, not from text invented by the model. The response exposes both `trace_id` and `X-Trace-ID` so a caller can correlate the answer with the full trace.

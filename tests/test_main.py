@@ -67,6 +67,17 @@ def test_tool_rejects_invalid_or_oversized_time_windows(dataset: Dataset) -> Non
         run_query_runs(dataset, {"start_date": "2026-01-01", "end_date": "2026-04-02"})
 
 
+def test_calendar_date_wins_over_redundant_full_day_range(dataset: Dataset) -> None:
+    result = run_aggregate_runs(dataset, {
+        "date": "2026-06-15",
+        "start_date": "2026-06-15T00:00:00Z",
+        "end_date": "2026-06-15T23:55:00Z",
+        "group_by": ["robot_id"],
+        "metrics": ["sum_nitrogen"],
+    })
+    assert len(result["rows"]) == 6
+
+
 def test_parse_rejects_negative_measurements() -> None:
     raw = b"ts,robot_id,field,state,battery_pct,nitrogen_applied_l,distance_m\n2026-01-01T00:00:00Z,MR-01,F,driving,50,-1,2\n"
     with pytest.raises(ValueError, match="nitrogen_applied_l cannot contain negative"):
@@ -81,6 +92,18 @@ MR-01: ( \frac{173.05}{16901} \approx 0.01024 ) L/m""")
     assert "$$" in reply
     assert r"\(" in reply and r"\)" in reply
     assert "\n[" not in reply and "\n]" not in reply
+
+
+def test_fallback_planner_uses_dataset_aggregates(dataset: Dataset) -> None:
+    result = main.fallback_aggregate_answer(dataset, "Which robot had the lowest average battery percentage on June 15?")
+    assert result is not None
+    reply, args, _ = result
+    assert "MR-02" in reply and "57.13%" in reply
+    assert args == {"date": "2026-06-15", "group_by": ["robot_id"], "metrics": ["avg_battery"]}
+
+    result = main.fallback_aggregate_answer(dataset, "Which date had the lowest fleet efficiency in litres per kilometre?")
+    assert result is not None
+    assert "June 16, 2026" in result[0] and "7.85 L/km" in result[0]
 
 
 def test_weather_requires_a_location(dataset: Dataset) -> None:
@@ -154,6 +177,9 @@ def test_query_truncates_large_result_to_fifty_rows(dataset: Dataset) -> None:
 def test_scoring_requires_key_facts() -> None:
     assert score_reply("The winner is MR-04 with 210.49 L.", "MR-04, 210.49 L")[0]
     assert not score_reply("MR-02 applied the most.", "MR-04, 210.49 L")[0]
+    assert score_reply("The fleet total was 1,012.0 L.", "1012.00 L")[0]
+    assert score_reply("Creekside covered 11,036 m.", "Creekside, 11036 m")[0]
+    assert not score_reply("MR-01 averaged 57.24%.", "MR-01, 57.13%")[0]
 
 
 def test_aggregate_result_creates_visualization() -> None:
@@ -176,6 +202,22 @@ def test_aggregate_result_creates_visualization() -> None:
     assert chart is not None
     assert chart["labels"] == ["MR-01", "MR-04"]
     assert chart["datasets"][0]["data"] == [100.0, 210.49]
+
+
+def test_visualization_prefers_nonzero_result_when_model_explores_states() -> None:
+    trace = {
+        "steps": [
+            {"id": "idle", "type": "tool", "name": "aggregate_runs", "result": {
+                "filters": {"state": "idle"}, "group_by": ["robot_id"], "metrics": ["sum_nitrogen"],
+                "rows": [{"robot_id": "MR-01", "sum_nitrogen": 0.0}],
+            }},
+            {"id": "applying", "type": "tool", "name": "aggregate_runs", "result": {
+                "filters": {"state": "applying"}, "group_by": ["robot_id"], "metrics": ["sum_nitrogen"],
+                "rows": [{"robot_id": "MR-01", "sum_nitrogen": 12.0}],
+            }},
+        ]
+    }
+    assert build_visualization(trace)["source_step_id"] == "applying"
 
 
 def test_evidence_summarizes_tool_provenance() -> None:
