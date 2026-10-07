@@ -4,7 +4,8 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from main import Dataset, analytics, build_evidence, build_visualization, parse_dataset, run_aggregate_runs, run_query_runs, score_reply
+import main
+from main import Dataset, analytics, build_evidence, build_visualization, parse_dataset, run_aggregate_runs, run_chat, run_query_runs, score_reply
 
 
 CSV = Path(__file__).parents[1] / "robot_runs.csv"
@@ -53,6 +54,13 @@ def test_query_is_capped_at_fifty_rows(dataset: Dataset) -> None:
     assert not result["truncated"]
 
 
+def test_query_truncates_large_result_to_fifty_rows(dataset: Dataset) -> None:
+    result = run_query_runs(dataset, {})
+    assert result["row_count"] == 5184
+    assert len(result["rows"]) == 50
+    assert result["truncated"]
+
+
 def test_scoring_requires_key_facts() -> None:
     assert score_reply("The winner is MR-04 with 210.49 L.", "MR-04, 210.49 L")[0]
     assert not score_reply("MR-02 applied the most.", "MR-04, 210.49 L")[0]
@@ -97,6 +105,57 @@ def test_evidence_summarizes_tool_provenance() -> None:
     assert evidence["tools"] == ["aggregate_runs"]
     assert evidence["result_rows"] == 1
     assert evidence["effective_time_ranges"][0]["start"].startswith("2026-06-15")
+
+
+class FakeCall:
+    type = "function_call"
+
+    def __init__(self, name: str, arguments: str, call_id: str = "call_test") -> None:
+        self.name = name
+        self.arguments = arguments
+        self.call_id = call_id
+
+    def model_dump(self, **_: object) -> dict[str, str]:
+        return {"type": "function_call", "name": self.name, "arguments": self.arguments, "call_id": self.call_id}
+
+
+class FakeResponse:
+    def __init__(self, output: list[FakeCall], output_text: str = "") -> None:
+        self.output = output
+        self.output_text = output_text
+        self.usage = type("Usage", (), {"input_tokens": 3, "output_tokens": 2})()
+
+
+class FakeResponsesClient:
+    def __init__(self, responses: list[FakeResponse]) -> None:
+        self.responses = self
+        self._responses = iter(responses)
+
+    def create(self, **_: object) -> FakeResponse:
+        return next(self._responses)
+
+
+def test_tool_error_is_returned_and_turn_recovers(dataset: Dataset, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeResponsesClient([
+        FakeResponse([FakeCall("query_runs", '{"limit": 51}')]),
+        FakeResponse([], "I could not use that limit, so I continued without returning the oversized result."),
+    ])
+    monkeypatch.setattr(main, "client", lambda: fake)
+    monkeypatch.setattr(main, "TRACES", [])
+    result = run_chat(dataset, [main.Message(role="user", content="Show me the runs")])
+    assert result["reply"].startswith("I could not use")
+    assert result["trace"]["outcome"] == "answered"
+    assert result["trace"]["steps"][1]["error"]
+    assert result["trace"]["steps"][1]["result"]["error"]
+
+
+def test_turn_stops_at_eight_model_calls(dataset: Dataset, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeResponsesClient([FakeResponse([FakeCall("aggregate_runs", "{}", f"call_{i}")]) for i in range(8)])
+    monkeypatch.setattr(main, "client", lambda: fake)
+    monkeypatch.setattr(main, "TRACES", [])
+    result = run_chat(dataset, [main.Message(role="user", content="Keep calling tools")])
+    assert result["trace"]["outcome"] == "stopped_at_cap"
+    assert sum(step["type"] == "model" for step in result["trace"]["steps"]) == 8
 
 
 def test_analytics_empty() -> None:
