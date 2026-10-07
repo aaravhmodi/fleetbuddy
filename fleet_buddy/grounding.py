@@ -30,7 +30,9 @@ LIMITATION_PHRASES = (
 ENVIRONMENT_QUERY_TERMS = ("weather", "soil moisture", "temperature", "rain", "precipitation")
 
 
-LOCATION_REQUEST_PHRASES = ("what city", "which city", "what location", "which location", "provide a location", "coordinates should i use")
+LOCATION_REQUEST_RE = re.compile(
+    r"\b(what|which|provide|share|specify|tell me|need)\b[^.?!]{0,40}\b(city|location|region|coordinates)\b"
+)
 
 
 def grounding_required(messages: list[Message]) -> bool:
@@ -44,23 +46,23 @@ def reply_states_limitation(reply: str) -> bool:
 
 
 def ensure_environment_follow_up(messages: list[Message], reply: str, steps: list[dict[str, Any]]) -> str:
-    # If the user asked about weather but no lookup happened, make sure the reply asks for a location.
+    # If the user asked about weather and no tool ran, make sure the reply says the CSV can't
+    # answer it and asks for a location for the external lookup.
     user_text = " ".join(message.content.lower() for message in messages if message.role == "user")
-    lowered_reply = reply.lower()
     environmental = any(term in user_text for term in ENVIRONMENT_QUERY_TERMS)
-    weather_succeeded = any(
-        step.get("type") == "tool" and step.get("name") == "get_weather" and not step.get("error")
-        for step in steps
-    )
-    already_asks = any(phrase in lowered_reply for phrase in LOCATION_REQUEST_PHRASES)
-    if not environmental or weather_succeeded or already_asks or not reply_states_limitation(reply):
+    any_tool_succeeded = any(step.get("type") == "tool" and not step.get("error") for step in steps)
+    if not environmental or any_tool_succeeded:
         return reply
     subject = "soil moisture" if "soil moisture" in user_text else "weather"
-    return (
-        reply.rstrip()
-        + f"\n\nI can look up external historical {subject} from Open-Meteo. "
-        + "What city, region, or coordinates should I use?"
-    )
+    if not reply_states_limitation(reply):
+        reply = f"The uploaded CSV doesn't contain {subject} data, so it can't answer this directly. " + reply.lstrip()
+    if not LOCATION_REQUEST_RE.search(reply.lower()):
+        reply = (
+            reply.rstrip()
+            + f"\n\nI can look up external historical {subject} from Open-Meteo. "
+            + "What city, region, or coordinates should I use?"
+        )
+    return reply
 
 
 def previous_trace_context(previous_trace: dict[str, Any] | None) -> tuple[str, list[dict[str, Any]]]:

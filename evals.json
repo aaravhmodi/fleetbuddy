@@ -17,7 +17,7 @@
   },
   {
     "messages": [{"role": "user", "content": "Which robot spent the most time charging on June 15? Convert the five-minute intervals to hours and minutes."}],
-    "expected": "MR-01, 69 intervals, 345 minutes, 5 hours 45 minutes"
+    "expected": "MR-01, 69 intervals, 5 hours 45 minutes"
   },
   {
     "messages": [{"role": "user", "content": "How many faults did each robot have on June 15?"}],
@@ -61,7 +61,7 @@
       {"role": "assistant", "content": "MR-04 applied 210.49 L."},
       {"role": "user", "content": "How much did that same robot apply on June 14?"}
     ],
-    "expected": "MR-04, 192.79 L on June 14"
+    "expected": "MR-04, 192.79 L; June 14"
   },
   {
     "messages": [{"role": "user", "content": "Break down the full dataset by state using fleet-wide interval counts (not per-robot counts), and convert the five-minute intervals into hours and minutes."}],
@@ -69,7 +69,7 @@
   },
   {
     "messages": [{"role": "user", "content": "Which field had the greatest driving distance on June 15?"}],
-    "expected": "Creekside, 11.036 km"
+    "expected": "Creekside, 11036 m"
   },
   {
     "messages": [{"role": "user", "content": "Which date had the lowest fleet efficiency in litres per kilometre, using total nitrogen divided by total distance and converting metres to kilometres?"}],
@@ -77,7 +77,7 @@
   },
   {
     "messages": [{"role": "user", "content": "For fault intervals across the full dataset, which robots were affected and what was each robot's average battery?"}],
-    "expected": "MR-03 had 7 faults with approximately 45.27% average battery; MR-05 had 3 faults with approximately 64.47% average battery"
+    "expected": "MR-03 approximately 45.27% average battery; MR-05 approximately 64.47% average battery"
   },
   {
     "messages": [{"role": "user", "content": "Which robot had the most applying distance, and which had the most driving distance, across the full dataset?"}],

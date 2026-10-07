@@ -107,11 +107,22 @@ def validate_tool_window(args: dict[str, Any]) -> None:
         value = args.get(key)
         if value is not None and len(str(value)) > MAX_FILTER_STRING_LENGTH:
             raise ValueError(f"{key} exceeds maximum length of {MAX_FILTER_STRING_LENGTH}.")
-    # Models sometimes expand a calendar date into an equivalent full-day range.
-    # Treat the explicit calendar date as authoritative so that harmless duplicate
-    # context does not trigger a tool-call retry loop.
+    # Models sometimes expand a calendar date into an equivalent full-day range. That
+    # redundant range is accepted, but a range reaching outside the date is a conflict:
+    # silently keeping only the date would answer a different question than was asked.
     if args.get("date"):
-        parse_date(str(args["date"]))
+        day = parse_date(str(args["date"]))
+        assert day is not None
+        day_start = day.normalize()
+        start = parse_date(args.get("start_date"))
+        end = parse_date(args.get("end_date"))
+        if end is not None and len(str(args["end_date"])) <= 10:
+            end = end + pd.Timedelta(days=1)
+        if (start is not None and start < day_start) or (end is not None and end > day_start + pd.Timedelta(days=1)):
+            raise ValueError(
+                "date conflicts with start_date/end_date. Use date for one UTC calendar day, "
+                "or start_date/end_date for a range, not both."
+            )
         return
     start = parse_date(args.get("start_date"))
     end = parse_date(args.get("end_date"))

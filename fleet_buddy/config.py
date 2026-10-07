@@ -39,7 +39,7 @@ MAX_QUERY_WINDOW_DAYS = 90
 MAX_FILTER_STRING_LENGTH = 64
 
 
-PROMPT_VERSION = "fleet-buddy-2026-10-07.4"
+PROMPT_VERSION = "fleet-buddy-2026-10-07.5"
 
 
 OPEN_METEO_GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"

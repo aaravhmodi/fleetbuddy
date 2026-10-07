@@ -113,6 +113,28 @@ def test_calendar_date_wins_over_redundant_full_day_range(dataset: Dataset) -> N
     assert len(result["rows"]) == 6
 
 
+def test_date_conflicting_with_wider_range_is_an_error(dataset: Dataset) -> None:
+    with pytest.raises(ValueError, match="conflicts"):
+        run_aggregate_runs(dataset, {
+            "robot_id": "MR-01",
+            "date": "2026-06-15",
+            "start_date": "2026-06-14T00:00:00Z",
+            "end_date": "2026-06-16T23:55:00Z",
+            "group_by": ["state"],
+            "metrics": ["row_count"],
+        })
+
+
+def test_location_only_weather_reply_states_csv_limitation() -> None:
+    from fleet_buddy.grounding import ensure_environment_follow_up, reply_states_limitation
+
+    messages = [Message(role="user", content="What was the soil moisture on June 15?")]
+    reply = ensure_environment_follow_up(messages, "Please provide a specific location for June 15.", [])
+    assert reply.startswith("The uploaded CSV doesn't contain soil moisture data")
+    assert reply_states_limitation(reply)
+    assert "Open-Meteo" not in reply  # the model already asked for a location
+
+
 def test_parse_rejects_negative_measurements() -> None:
     raw = b"ts,robot_id,field,state,battery_pct,nitrogen_applied_l,distance_m\n2026-01-01T00:00:00Z,MR-01,F,driving,50,-1,2\n"
     with pytest.raises(ValueError, match="nitrogen_applied_l cannot contain negative"):
