@@ -18,13 +18,13 @@ EXPECTED_COLUMNS = [
 VALID_STATES = {"applying", "driving", "charging", "idle", "fault"}
 
 
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+MODEL = os.getenv("OPENAI_MODEL", "gpt-5.1")
 
 
-INPUT_PRICE_PER_TOKEN = 0.15 / 1_000_000
+INPUT_PRICE_PER_TOKEN = 1.25 / 1_000_000
 
 
-OUTPUT_PRICE_PER_TOKEN = 0.60 / 1_000_000
+OUTPUT_PRICE_PER_TOKEN = 10.00 / 1_000_000
 
 
 MAX_MODEL_CALLS = 8

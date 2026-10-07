@@ -16,7 +16,7 @@ Copy-Item .env.example .env
 uvicorn main:app --reload --env-file .env
 ```
 
-Open http://127.0.0.1:8000, upload `robot_runs.csv`, and use the chat and dashboard. The default model is `gpt-4o-mini`; set `OPENAI_MODEL` in `.env` to override it. The real `.env` is ignored by Git and must not be committed.
+Open http://127.0.0.1:8000, upload `robot_runs.csv`, and use the chat and dashboard. The default model is `gpt-5.1`; set `OPENAI_MODEL` in `.env` to override it. The real `.env` is ignored by Git and must not be committed.
 
 Run the API-key-free tests with:
 
@@ -59,7 +59,7 @@ The five-minute sampling interval is explicitly described to the model so a char
 
 Environmental data is deliberately marked as external evidence. The uploaded CSV remains the source of truth for robot metrics, while Open-Meteo historical weather and soil-moisture reanalysis are used only when the user supplies a location or coordinates. Evidence includes the resolved location, date range, units, and source in the trace; soil moisture is described as modeled reanalysis rather than an on-farm sensor reading.
 
-Each chat turn gets a unique trace ID. A trace contains the complete conversation, prompt version, model configuration, ordered model/tool steps, response IDs, arguments, returned results, errors, durations, usage, hard-coded cost, final reply, and outcome. It also records traced-step time, orchestration time outside those steps, and timing coverage so the waterfall can explain the entire turn. Model pricing is intentionally explicit (`$0.15 / 1M` input tokens and `$0.60 / 1M` output tokens) so the analytics are deterministic and easy to replace. Tool errors are returned as structured function output, allowing the model to recover; eight model calls is the turn cap.
+Each chat turn gets a unique trace ID. A trace contains the complete conversation, prompt version, model configuration, ordered model/tool steps, response IDs, arguments, returned results, errors, durations, usage, hard-coded cost, final reply, and outcome. It also records traced-step time, orchestration time outside those steps, and timing coverage so the waterfall can explain the entire turn. Model pricing is intentionally explicit (`$1.25 / 1M` input tokens and `$10.00 / 1M` output tokens, matching `gpt-5.1`; update them in `fleet_buddy/config.py` if you change `OPENAI_MODEL`) so the analytics are deterministic and easy to replace. Tool errors are returned as structured function output, allowing the model to recover; eight model calls is the turn cap.
 
 The chat response returns the trace ID in both the JSON body (`trace_id`) and the `X-Trace-ID` response header. The optional `previous_trace_id` request field makes the preceding structured tool evidence available to a follow-up without creating server-side chat sessions. Reuse is limited to explicit evidence questions; a new date, entity, filter, or metric still requires a new tool call. The full trace is stored in the process-memory `TRACES` list in `fleet_buddy/state.py`, and can be retrieved with `GET /traces/{trace_id}`. `GET /traces` returns newest-first summaries. This is intentionally not persistent: traces disappear when the process restarts because the assignment requests an in-memory implementation. In a production version, this list would be replaced with a trace store or OpenTelemetry backend.
 
