@@ -158,5 +158,16 @@ def test_turn_stops_at_eight_model_calls(dataset: Dataset, monkeypatch: pytest.M
     assert sum(step["type"] == "model" for step in result["trace"]["steps"]) == 8
 
 
+def test_separate_turns_have_separate_trace_ids_and_ordered_offsets(dataset: Dataset, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeResponsesClient([FakeResponse([], "first"), FakeResponse([], "second")])
+    monkeypatch.setattr(main, "client", lambda: fake)
+    monkeypatch.setattr(main, "TRACES", [])
+    first = run_chat(dataset, [main.Message(role="user", content="first")])
+    second = run_chat(dataset, [main.Message(role="user", content="second")])
+    assert first["trace_id"] != second["trace_id"]
+    assert first["trace"]["steps"][0]["start_offset_ms"] >= 0
+    assert second["trace"]["steps"][0]["start_offset_ms"] >= 0
+
+
 def test_analytics_empty() -> None:
     assert analytics()["turns"] >= 0
